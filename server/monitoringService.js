@@ -6,6 +6,7 @@ import {
   insertTrafficEvent,
   listPcapArtifacts,
   listRecentLogs,
+  listRecentSandboxAnalyses,
   listRecentTrafficEvents,
   listSensors,
   listTrafficMetrics,
@@ -26,6 +27,7 @@ import { ThreatIntelService } from './threatIntelService.js';
 import { FleetService } from './fleetService.js';
 import { ForensicsChatService } from './forensicsChatService.js';
 import { ProcessResolver } from './processResolver.js';
+import { SandboxService } from './sandboxService.js';
 
 const createId = () => crypto.randomUUID();
 
@@ -105,6 +107,11 @@ export class MonitoringService {
         });
       },
     });
+    this.sandboxService = new SandboxService({
+      onLog: (level, message, details) => {
+        this.emitLog(level, message, details);
+      },
+    });
     this.threatIntelService = new ThreatIntelService({
       onStatusChange: status => {
         this.threatIntelStatus = status;
@@ -149,6 +156,7 @@ export class MonitoringService {
         void this.applyExternalBlock(ipAddress, details);
       },
     });
+    this.sandboxService.configure(this.configuration);
     this.threatIntelService.configure(this.configuration);
     this.fleetService.configure(this.configuration);
     this.upsertLocalSensor();
@@ -214,6 +222,7 @@ export class MonitoringService {
       ...this.configuration,
       ...nextConfiguration,
       fleetSharedToken: nextConfiguration.fleetSharedToken || this.configuration.fleetSharedToken || '',
+      sandboxApiKey: nextConfiguration.sandboxApiKey || this.configuration.sandboxApiKey || '',
       providerSettings: mergedProviderSettings,
     });
     if (previousSensorId !== this.configuration.sensorId) {
@@ -222,12 +231,15 @@ export class MonitoringService {
     this.syncMetricSnapshots();
     this.threatIntelService.configure(this.configuration);
     this.fleetService.configure(this.configuration);
+    this.sandboxService.configure(this.configuration);
     this.upsertLocalSensor();
     this.emitLog('INFO', 'Configuration updated', {
       llmProvider: this.configuration.llmProvider,
       deploymentMode: this.configuration.deploymentMode,
       threatIntelEnabled: this.configuration.threatIntelEnabled,
       payloadMaskingMode: this.configuration.payloadMaskingMode,
+      sandboxEnabled: this.configuration.sandboxEnabled,
+      sandboxProvider: this.configuration.sandboxProvider,
       liveRawFeedEnabled: this.configuration.liveRawFeedEnabled,
       firewallIntegrationEnabled: this.configuration.firewallIntegrationEnabled,
       customRuleCount: this.configuration.customRules.length,
@@ -274,6 +286,7 @@ export class MonitoringService {
       traffic: listRecentTrafficEvents(100, sensorId),
       logs: listRecentLogs(500, sensorId),
       artifacts: listPcapArtifacts(50, sensorId),
+      sandboxAnalyses: listRecentSandboxAnalyses(25, sensorId),
       replayStatus: this.replayStatus,
       fleetStatus: {
         ...this.fleetService.getStatus(),
@@ -421,6 +434,25 @@ export class MonitoringService {
       payload: trafficEntry,
     });
     this.fleetService.publishTraffic(trafficEntry);
+
+    if (
+      this.configuration.sandboxEnabled
+      && this.configuration.sandboxAutoSubmitSuspicious
+      && trafficEntry.isSuspicious
+      && packet.localProcess?.executablePath
+    ) {
+      void this.analyzeLocalProcessFile({
+        filePath: packet.localProcess.executablePath,
+        processName: packet.localProcess.name ?? null,
+        trafficEventId: trafficEntry.id,
+      }).catch(error => {
+        this.emitLog('ERROR', 'Automatic sandbox submission failed.', {
+          error: error instanceof Error ? error.message : 'Sandbox submission failed.',
+          filePath: packet.localProcess?.executablePath,
+          trafficEventId: trafficEntry.id,
+        });
+      });
+    }
 
     if (trafficEntry.isSuspicious) {
       this.broadcast({
@@ -718,5 +750,21 @@ export class MonitoringService {
       sensorId,
       config: this.configuration,
     });
+  }
+
+  async analyzeLocalProcessFile({ filePath, processName = null, trafficEventId = null }) {
+    const analysis = await this.sandboxService.analyzeFile(filePath, {
+      processName,
+      trafficEventId,
+      sensorId: this.configuration.sensorId,
+      sensorName: this.configuration.sensorName,
+    });
+
+    this.broadcast({
+      type: 'sandbox-analysis',
+      payload: analysis,
+    });
+
+    return analysis;
   }
 }

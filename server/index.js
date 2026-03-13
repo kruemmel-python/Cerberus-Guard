@@ -10,6 +10,7 @@ import {
   getPcapArtifactById,
   listPcapArtifacts,
   listRecentLogs,
+  listRecentSandboxAnalyses,
   listRecentTrafficEvents,
   listSensors,
   listTrafficMetrics,
@@ -45,6 +46,11 @@ const forensicsSchema = z.object({
 });
 const openLocalPathSchema = z.object({
   path: z.string().trim().min(1),
+});
+const sandboxAnalyzeSchema = z.object({
+  path: z.string().trim().min(1),
+  processName: z.string().trim().optional().nullable(),
+  trafficEventId: z.string().trim().optional().nullable(),
 });
 
 app.use(express.json({ limit: '2mb' }));
@@ -217,6 +223,14 @@ app.get('/api/pcap-artifacts', (request, response) => {
   });
 });
 
+app.get('/api/sandbox/analyses', (request, response) => {
+  const limit = Number(request.query.limit || 25);
+  const sensorId = typeof request.query.sensorId === 'string' && request.query.sensorId.trim() ? request.query.sensorId.trim() : null;
+  response.json({
+    analyses: listRecentSandboxAnalyses(limit, sensorId),
+  });
+});
+
 app.get('/api/pcap-artifacts/:artifactId/download', (request, response) => {
   const artifact = getPcapArtifactById(request.params.artifactId);
   if (!artifact) {
@@ -273,6 +287,34 @@ app.post('/api/forensics/chat', async (request, response) => {
     response.status(400).json({
       ok: false,
       error: error instanceof Error ? error.message : 'Threat hunting request failed.',
+    });
+  }
+});
+
+app.post('/api/sandbox/analyze-process', async (request, response) => {
+  try {
+    const payload = sandboxAnalyzeSchema.parse(request.body);
+    const analysis = await monitoringService.analyzeLocalProcessFile({
+      filePath: payload.path,
+      processName: payload.processName || null,
+      trafficEventId: payload.trafficEventId || null,
+    });
+    response.json({
+      ok: true,
+      analysis,
+    });
+  } catch (error) {
+    const failedAnalysis = error?.analysis;
+    if (failedAnalysis) {
+      monitoringService.broadcast?.({
+        type: 'sandbox-analysis',
+        payload: failedAnalysis,
+      });
+    }
+    response.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Sandbox analysis failed.',
+      analysis: failedAnalysis ?? null,
     });
   }
 });

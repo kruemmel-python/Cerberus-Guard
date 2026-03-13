@@ -9,6 +9,9 @@ export type DeploymentMode = 'standalone' | 'hub' | 'agent';
 export type PayloadMaskingMode = 'strict' | 'raw_local_only';
 
 export type ThreatIntelFeedFormat = 'plain' | 'spamhaus_drop' | 'json_array';
+export type SandboxProvider = 'none' | 'cape';
+export type SandboxAnalysisStatus = 'queued' | 'running' | 'completed' | 'failed';
+export type SandboxVerdict = 'malicious' | 'suspicious' | 'clean' | 'unknown';
 
 export type ProcessResolutionStrategy = 'exact' | 'listener' | 'local_port' | 'unresolved';
 export type ProcessSignatureStatus = string;
@@ -159,6 +162,29 @@ export interface WebhookIntegration {
   provider: WebhookProvider;
   url: string;
   enabled: boolean;
+}
+
+export interface SandboxAnalysisSummary {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  status: SandboxAnalysisStatus;
+  provider: SandboxProvider;
+  verdict: SandboxVerdict;
+  summary: string;
+  score: number | null;
+  filePath: string;
+  fileName: string;
+  fileSize: number;
+  sha256: string;
+  processName: string | null;
+  trafficEventId: string | null;
+  externalTaskId: string | null;
+  reportUrl: string | null;
+  errorMessage: string | null;
+  signatures: string[];
+  sensorId: string;
+  sensorName: string;
 }
 
 export interface CaptureInterface {
@@ -349,6 +375,13 @@ export interface Configuration {
   firewallIntegrationEnabled: boolean;
   pcapBufferSize: number;
   payloadMaskingMode: PayloadMaskingMode;
+  sandboxEnabled: boolean;
+  sandboxProvider: SandboxProvider;
+  sandboxBaseUrl: string;
+  sandboxApiKey: string;
+  sandboxPollingIntervalMs: number;
+  sandboxTimeoutSeconds: number;
+  sandboxAutoSubmitSuspicious: boolean;
   threatIntelEnabled: boolean;
   threatIntelRefreshHours: number;
   threatIntelAutoBlock: boolean;
@@ -371,6 +404,7 @@ export interface BootstrapPayload {
   traffic: TrafficLogEntry[];
   logs: LogEntry[];
   artifacts: PcapArtifact[];
+  sandboxAnalyses: SandboxAnalysisSummary[];
   replayStatus: ReplayStatusPayload;
   fleetStatus: FleetStatusPayload;
   sensors: SensorSummary[];
@@ -416,6 +450,10 @@ export type BackendWsMessage =
   | {
       type: 'pcap-artifact';
       payload: PcapArtifact;
+    }
+  | {
+      type: 'sandbox-analysis';
+      payload: SandboxAnalysisSummary;
     }
   | {
       type: 'fleet-status';

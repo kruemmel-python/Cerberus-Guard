@@ -16,6 +16,7 @@ import {
   MonitoringStatus,
   Packet,
   PcapArtifact,
+  SandboxAnalysisSummary,
   SensorSummary,
   TrafficLogEntry,
   TrafficMetricPoint,
@@ -31,6 +32,7 @@ interface DashboardProps {
   onStopMonitoring: () => void;
   onStartReplay: (file: File, speedMultiplier: number) => Promise<void>;
   onRevealProcessPath: (targetPath: string) => Promise<void>;
+  onAnalyzeProcessInSandbox: (targetPath: string, options?: { processName?: string | null; trafficEventId?: string | null }) => Promise<SandboxAnalysisSummary | void>;
   monitoringStatus: MonitoringStatus;
   llmStatus: { loaded: boolean; model: string };
   metricsSnapshot: MetricSnapshot;
@@ -38,6 +40,7 @@ interface DashboardProps {
   rawPacketFeed: Packet[];
   trafficMetrics: TrafficMetricPoint[];
   artifacts: PcapArtifact[];
+  sandboxAnalyses: SandboxAnalysisSummary[];
   rawFeedEnabled: boolean;
   getArtifactDownloadUrl: (artifactId: string) => string;
   sensors: SensorSummary[];
@@ -108,6 +111,32 @@ const getActionClass = (actionType: ActionType): string => {
   }
 };
 
+const getSandboxVerdictClass = (verdict: SandboxAnalysisSummary['verdict']) => {
+  switch (verdict) {
+    case 'malicious':
+      return 'text-red-300';
+    case 'suspicious':
+      return 'text-orange-300';
+    case 'clean':
+      return 'text-emerald-300';
+    default:
+      return 'text-gray-300';
+  }
+};
+
+const getSandboxStatusClass = (status: SandboxAnalysisSummary['status']) => {
+  switch (status) {
+    case 'completed':
+      return 'border-emerald-500/30 bg-emerald-500/15 text-emerald-100';
+    case 'failed':
+      return 'border-red-500/30 bg-red-500/15 text-red-100';
+    case 'running':
+      return 'border-blue-500/30 bg-blue-500/15 text-blue-100';
+    default:
+      return 'border-gray-600/50 bg-gray-700/50 text-gray-300';
+  }
+};
+
 const formatLocaleTimestamp = (isoString: string, localeCode: string) => {
   try {
     return new Intl.DateTimeFormat(localeCode, {
@@ -163,12 +192,18 @@ const TrafficRow: React.FC<{
   onFilterByProcess: (value: string) => void;
   onCopyProcessPath: (targetPath: string) => Promise<void>;
   onRevealProcessPath: (targetPath: string) => Promise<void>;
+  onSandboxAnalyze: (targetPath: string, options?: { processName?: string | null; trafficEventId?: string | null }) => Promise<void>;
+  latestSandboxAnalysis: SandboxAnalysisSummary | null;
+  sandboxActionPending: boolean;
 }> = ({
   entry,
   getArtifactDownloadUrl,
   onFilterByProcess,
   onCopyProcessPath,
   onRevealProcessPath,
+  onSandboxAnalyze,
+  latestSandboxAnalysis,
+  sandboxActionPending,
 }) => {
   const { packet, attackType, confidence, action, explanation, decisionSource, pcapArtifactId, firewallApplied } = entry;
   const { t } = useLocalization();
@@ -230,6 +265,17 @@ const TrafficRow: React.FC<{
                   .join(', ')}
               </div>
             )}
+            {latestSandboxAnalysis && (
+              <div className="mt-1 text-[11px] text-gray-400">
+                <span className="font-semibold text-gray-300">{t('sandboxStatusLabel')}:</span>{' '}
+                <span className={getSandboxVerdictClass(latestSandboxAnalysis.verdict)}>
+                  {t(`sandboxVerdict_${latestSandboxAnalysis.verdict}`)}
+                </span>
+                {' • '}
+                {t(`sandboxStatus_${latestSandboxAnalysis.status}`)}
+                {latestSandboxAnalysis.score !== null ? ` • ${latestSandboxAnalysis.score.toFixed(1)}` : ''}
+              </div>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -266,6 +312,17 @@ const TrafficRow: React.FC<{
                     className="rounded-md border border-gray-600 px-2 py-1 text-[11px] font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
                   >
                     {t('processOpenFolder')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onSandboxAnalyze(localProcess.executablePath!, {
+                      processName: localProcess.name,
+                      trafficEventId: entry.id,
+                    })}
+                    disabled={sandboxActionPending}
+                    className="rounded-md border border-gray-600 px-2 py-1 text-[11px] font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {sandboxActionPending ? t('sandboxAnalyzeRunning') : t('sandboxAnalyzeButton')}
                   </button>
                 </>
               )}
@@ -329,6 +386,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onStopMonitoring,
   onStartReplay,
   onRevealProcessPath,
+  onAnalyzeProcessInSandbox,
   monitoringStatus,
   llmStatus,
   metricsSnapshot,
@@ -336,6 +394,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   rawPacketFeed,
   trafficMetrics,
   artifacts,
+  sandboxAnalyses,
   rawFeedEnabled,
   getArtifactDownloadUrl,
   sensors,
@@ -347,6 +406,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [replaySpeed, setReplaySpeed] = useState(10);
   const [processFilter, setProcessFilter] = useState('');
   const [processActionState, setProcessActionState] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
+  const [sandboxActionPath, setSandboxActionPath] = useState<string | null>(null);
 
   const chartData = useMemo(
     () => trafficMetrics.map(metric => ({
@@ -359,6 +419,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
     () => liveTrafficFeed.filter(entry => matchesProcessFilter(entry, processFilter)),
     [liveTrafficFeed, processFilter]
   );
+  const latestSandboxAnalysesByPath = useMemo(() => {
+    const analysisMap = new Map<string, SandboxAnalysisSummary>();
+    sandboxAnalyses.forEach(analysis => {
+      if (!analysisMap.has(analysis.filePath)) {
+        analysisMap.set(analysis.filePath, analysis);
+      }
+    });
+    return analysisMap;
+  }, [sandboxAnalyses]);
 
   const handleCopyProcessPath = async (targetPath: string) => {
     try {
@@ -391,6 +460,24 @@ export const Dashboard: React.FC<DashboardProps> = ({
         tone: 'error',
         message: t('processActionFailed'),
       });
+    }
+  };
+
+  const handleSandboxAnalyze = async (targetPath: string, options?: { processName?: string | null; trafficEventId?: string | null }) => {
+    try {
+      setSandboxActionPath(targetPath);
+      await onAnalyzeProcessInSandbox(targetPath, options);
+      setProcessActionState({
+        tone: 'success',
+        message: t('sandboxAnalyzeQueued'),
+      });
+    } catch {
+      setProcessActionState({
+        tone: 'error',
+        message: t('sandboxAnalyzeFailed'),
+      });
+    } finally {
+      setSandboxActionPath(currentPath => (currentPath === targetPath ? null : currentPath));
     }
   };
 
@@ -640,6 +727,69 @@ export const Dashboard: React.FC<DashboardProps> = ({
         </section>
       </div>
 
+      <section className="rounded-2xl border border-gray-700/60 bg-[#161B22] p-5 shadow-xl">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <h2 className="text-xl font-semibold text-white">{t('sandboxTitle')}</h2>
+            <p className="text-sm text-gray-400">{t('sandboxDescription')}</p>
+          </div>
+          <div className="text-sm text-gray-400">{sandboxAnalyses.length.toLocaleString()} {t('sandboxRecentAnalyses')}</div>
+        </div>
+
+        <div className="mt-5 space-y-3">
+          {sandboxAnalyses.length === 0 && (
+            <div className="rounded-xl border border-dashed border-gray-700 p-6 text-center text-sm text-gray-500">
+              {t('sandboxNoAnalyses')}
+            </div>
+          )}
+
+          {sandboxAnalyses.map(analysis => (
+            <div key={analysis.id} className="rounded-xl border border-gray-700 bg-gray-900/40 p-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-white">{analysis.fileName}</div>
+                  <div className="mt-1 text-xs text-gray-400">
+                    {formatLocaleTimestamp(analysis.updatedAt, t('localeCode'))} • {analysis.sensorName} • {analysis.provider.toUpperCase()} • {formatBytes(analysis.fileSize)}
+                  </div>
+                  <div className={`mt-2 text-sm font-semibold ${getSandboxVerdictClass(analysis.verdict)}`}>
+                    {t(`sandboxVerdict_${analysis.verdict}`)}
+                    {analysis.score !== null ? ` • ${analysis.score.toFixed(1)}` : ''}
+                  </div>
+                  <div className="mt-2 text-sm text-gray-400">{analysis.summary}</div>
+                  {analysis.signatures.length > 0 && (
+                    <div className="mt-2 text-xs text-gray-500">
+                      {t('sandboxSignatures')}: {analysis.signatures.slice(0, 5).join(', ')}
+                    </div>
+                  )}
+                  {analysis.errorMessage && (
+                    <div className="mt-2 text-xs text-red-300">{analysis.errorMessage}</div>
+                  )}
+                </div>
+                <div className="flex flex-col gap-2">
+                  <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${getSandboxStatusClass(analysis.status)}`}>
+                    {t(`sandboxStatus_${analysis.status}`)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyProcessPath(analysis.filePath)}
+                    className="rounded-lg border border-gray-600 px-3 py-2 text-sm font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
+                  >
+                    {t('processCopyPath')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRevealProcessPath(analysis.filePath)}
+                    className="rounded-lg border border-gray-600 px-3 py-2 text-sm font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
+                  >
+                    {t('processOpenFolder')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
       <div className="overflow-hidden rounded-2xl border border-gray-700/60 bg-[#161B22] shadow-xl">
         <div className="border-b border-gray-700/50 p-4">
           <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
@@ -707,6 +857,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
                     onFilterByProcess={setProcessFilter}
                     onCopyProcessPath={handleCopyProcessPath}
                     onRevealProcessPath={handleRevealProcessPath}
+                    onSandboxAnalyze={handleSandboxAnalyze}
+                    latestSandboxAnalysis={entry.packet.localProcess?.executablePath ? latestSandboxAnalysesByPath.get(entry.packet.localProcess.executablePath) ?? null : null}
+                    sandboxActionPending={entry.packet.localProcess?.executablePath === sandboxActionPath}
                   />
                 ))
               ) : (

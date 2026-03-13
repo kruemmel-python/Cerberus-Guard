@@ -8,6 +8,7 @@ import { FleetManagement } from './components/FleetManagement';
 import { ThreatHunter } from './components/ThreatHunter';
 import {
   buildTrafficWebSocketUrl,
+  analyzeProcessFileInSandbox,
   getBootstrap,
   getBackendHealth,
   listCaptureInterfaces,
@@ -32,6 +33,7 @@ import {
   MonitoringStatus,
   Packet,
   PcapArtifact,
+  SandboxAnalysisSummary,
   ReplayStatusPayload,
   SensorSummary,
   ThreatIntelStatus,
@@ -45,6 +47,7 @@ const MAX_LOG_ENTRIES = 500;
 const MAX_FEED_ENTRIES = 100;
 const MAX_ARTIFACT_ENTRIES = 50;
 const MAX_RAW_FEED_ENTRIES = 25;
+const MAX_SANDBOX_ANALYSES = 25;
 const CONFIG_SYNC_DELAY_MS = 700;
 const BACKEND_SWITCH_DELAY_MS = 500;
 const SOCKET_RECONNECT_DELAY_MS = 3000;
@@ -118,6 +121,7 @@ const App: React.FC = () => {
   const [rawPacketFeed, setRawPacketFeed] = useState<Packet[]>([]);
   const [trafficMetrics, setTrafficMetrics] = useState<TrafficMetricPoint[]>([]);
   const [artifacts, setArtifacts] = useState<PcapArtifact[]>([]);
+  const [sandboxAnalyses, setSandboxAnalyses] = useState<SandboxAnalysisSummary[]>([]);
   const [availableInterfaces, setAvailableInterfaces] = useState<CaptureInterface[]>([]);
   const [monitoringStatus, setMonitoringStatus] = useState<MonitoringStatus>(createInitialMonitoringStatus);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricSnapshot>(createInitialMetricSnapshot);
@@ -226,6 +230,7 @@ const App: React.FC = () => {
         }
         setTrafficMetrics(payload.metricSeries);
         setArtifacts(payload.artifacts.slice(0, MAX_ARTIFACT_ENTRIES));
+        setSandboxAnalyses(payload.sandboxAnalyses.slice(0, MAX_SANDBOX_ANALYSES));
         setMetricsSnapshot(payload.metrics);
         setSensors(payload.sensors);
         setMonitoringStatus(previousStatus => ({
@@ -308,6 +313,13 @@ const App: React.FC = () => {
         if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
           startTransition(() => {
             setArtifacts(previousArtifacts => mergeById(previousArtifacts, message.payload, MAX_ARTIFACT_ENTRIES));
+          });
+        }
+        return;
+      case 'sandbox-analysis':
+        if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
+          startTransition(() => {
+            setSandboxAnalyses(previousAnalyses => mergeById(previousAnalyses, message.payload, MAX_SANDBOX_ANALYSES));
           });
         }
         return;
@@ -535,6 +547,27 @@ const App: React.FC = () => {
     }
   }, [appendClientLog, t]);
 
+  const analyzeProcessInSandbox = useCallback(async (
+    targetPath: string,
+    options?: { processName?: string | null; trafficEventId?: string | null }
+  ) => {
+    try {
+      const response = await analyzeProcessFileInSandbox(configRef.current.backendBaseUrl, targetPath, options);
+      startTransition(() => {
+        setSandboxAnalyses(previousAnalyses => mergeById(previousAnalyses, response.analysis, MAX_SANDBOX_ANALYSES));
+      });
+      return response.analysis;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('sandboxAnalyzeFailed'), LogLevel.ERROR, {
+        error: message,
+        targetPath,
+        trafficEventId: options?.trafficEventId || null,
+      });
+      throw error;
+    }
+  }, [appendClientLog, t]);
+
   useEffect(() => {
     activeBaseUrlRef.current = config.backendBaseUrl.trim() || 'http://localhost:8081';
     saveClientPreferences({ backendBaseUrl: activeBaseUrlRef.current });
@@ -661,6 +694,10 @@ const App: React.FC = () => {
     () => (selectedSensorId ? artifacts.filter(artifact => artifact.sensorId === selectedSensorId) : artifacts),
     [artifacts, selectedSensorId]
   );
+  const sensorScopedSandboxAnalyses = useMemo(
+    () => (selectedSensorId ? sandboxAnalyses.filter(analysis => analysis.sensorId === selectedSensorId) : sandboxAnalyses),
+    [sandboxAnalyses, selectedSensorId]
+  );
   const sensorScopedRawPackets = useMemo(
     () => (selectedSensorId ? rawPacketFeed.filter(packet => packet.sensorId === selectedSensorId) : rawPacketFeed),
     [rawPacketFeed, selectedSensorId]
@@ -678,6 +715,7 @@ const App: React.FC = () => {
             onStopMonitoring={stopMonitoringGracefully}
             onStartReplay={startReplayCapture}
             onRevealProcessPath={revealProcessPath}
+            onAnalyzeProcessInSandbox={analyzeProcessInSandbox}
             monitoringStatus={monitoringStatus}
             llmStatus={llmStatus}
             metricsSnapshot={metricsSnapshot}
@@ -685,6 +723,7 @@ const App: React.FC = () => {
             rawPacketFeed={sensorScopedRawPackets}
             trafficMetrics={trafficMetrics}
             artifacts={sensorScopedArtifacts}
+            sandboxAnalyses={sensorScopedSandboxAnalyses}
             rawFeedEnabled={config.liveRawFeedEnabled}
             getArtifactDownloadUrl={(artifactId) => getArtifactDownloadUrl(config.backendBaseUrl, artifactId)}
             sensors={sensors}

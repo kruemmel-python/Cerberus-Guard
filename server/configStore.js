@@ -29,6 +29,8 @@ const threatIntelSourceSchema = z.object({
   enabled: z.boolean(),
 });
 
+const sandboxProviderSchema = z.enum(['none', 'cape']);
+
 const customRuleConditionSchema = z.object({
   id: z.string().min(1).default(() => crypto.randomUUID()),
   field: z.enum([
@@ -105,6 +107,13 @@ const serverConfigurationSchema = z.object({
   firewallIntegrationEnabled: z.boolean(),
   pcapBufferSize: z.number().int().min(1).max(100),
   payloadMaskingMode: z.enum(['strict', 'raw_local_only']),
+  sandboxEnabled: z.boolean(),
+  sandboxProvider: sandboxProviderSchema,
+  sandboxBaseUrl: z.string().trim().min(1),
+  sandboxApiKey: z.string().optional().default(''),
+  sandboxPollingIntervalMs: z.number().int().min(1000).max(60000),
+  sandboxTimeoutSeconds: z.number().int().min(30).max(3600),
+  sandboxAutoSubmitSuspicious: z.boolean(),
   threatIntelEnabled: z.boolean(),
   threatIntelRefreshHours: z.number().int().min(1).max(168),
   threatIntelAutoBlock: z.boolean(),
@@ -119,6 +128,7 @@ const serverConfigurationSchema = z.object({
 export const sanitizeConfigurationForClient = (configuration) => ({
   ...configuration,
   fleetSharedToken: '',
+  sandboxApiKey: '',
   providerSettings: Object.fromEntries(
     Object.entries(configuration.providerSettings).map(([providerId, settings]) => [
       providerId,

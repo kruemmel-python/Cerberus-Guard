@@ -69,6 +69,32 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_pcap_created_at ON pcap_artifacts (created_at DESC);
 
+  CREATE TABLE IF NOT EXISTS sandbox_analyses (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    score REAL,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    process_name TEXT,
+    traffic_event_id TEXT,
+    external_task_id TEXT,
+    report_url TEXT,
+    error_message TEXT,
+    signatures_json TEXT NOT NULL,
+    raw_json TEXT,
+    sensor_id TEXT,
+    sensor_name TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_sandbox_created_at ON sandbox_analyses (created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_sandbox_sha256 ON sandbox_analyses (sha256);
+
   CREATE TABLE IF NOT EXISTS sensors (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -124,6 +150,8 @@ ensureColumn('traffic_events', 'sensor_id', 'TEXT');
 ensureColumn('traffic_events', 'sensor_name', 'TEXT');
 ensureColumn('pcap_artifacts', 'sensor_id', 'TEXT');
 ensureColumn('pcap_artifacts', 'sensor_name', 'TEXT');
+ensureColumn('sandbox_analyses', 'sensor_id', 'TEXT');
+ensureColumn('sandbox_analyses', 'sensor_name', 'TEXT');
 
 const configRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('activeConfig');
 if (!configRow) {
@@ -334,6 +362,94 @@ export const insertPcapArtifact = (artifact) => {
     sensorName: artifact.sensorName ?? null,
   });
   return artifact;
+};
+
+export const upsertSandboxAnalysis = (analysis) => {
+  db.prepare(`
+    INSERT OR REPLACE INTO sandbox_analyses (
+      id, created_at, updated_at, status, provider, verdict, summary, score, file_path, file_name,
+      file_size, sha256, process_name, traffic_event_id, external_task_id, report_url, error_message,
+      signatures_json, raw_json, sensor_id, sensor_name
+    ) VALUES (
+      @id, @createdAt, @updatedAt, @status, @provider, @verdict, @summary, @score, @filePath, @fileName,
+      @fileSize, @sha256, @processName, @trafficEventId, @externalTaskId, @reportUrl, @errorMessage,
+      @signaturesJson, @rawJson, @sensorId, @sensorName
+    )
+  `).run({
+    id: analysis.id,
+    createdAt: analysis.createdAt,
+    updatedAt: analysis.updatedAt,
+    status: analysis.status,
+    provider: analysis.provider,
+    verdict: analysis.verdict,
+    summary: analysis.summary,
+    score: analysis.score ?? null,
+    filePath: analysis.filePath,
+    fileName: analysis.fileName,
+    fileSize: analysis.fileSize,
+    sha256: analysis.sha256,
+    processName: analysis.processName ?? null,
+    trafficEventId: analysis.trafficEventId ?? null,
+    externalTaskId: analysis.externalTaskId ?? null,
+    reportUrl: analysis.reportUrl ?? null,
+    errorMessage: analysis.errorMessage ?? null,
+    signaturesJson: serialize(analysis.signatures ?? []),
+    rawJson: serialize(analysis.raw ?? null),
+    sensorId: analysis.sensorId ?? null,
+    sensorName: analysis.sensorName ?? null,
+  });
+
+  return analysis;
+};
+
+const mapSandboxAnalysisRow = row => ({
+  id: row.id,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+  status: row.status,
+  provider: row.provider,
+  verdict: row.verdict,
+  summary: row.summary,
+  score: row.score === null || row.score === undefined ? null : Number(row.score),
+  filePath: row.filePath,
+  fileName: row.fileName,
+  fileSize: Number(row.fileSize ?? 0),
+  sha256: row.sha256,
+  processName: row.processName ?? null,
+  trafficEventId: row.trafficEventId ?? null,
+  externalTaskId: row.externalTaskId ?? null,
+  reportUrl: row.reportUrl ?? null,
+  errorMessage: row.errorMessage ?? null,
+  signatures: deserialize(row.signaturesJson, []),
+  sensorId: row.sensorId ?? 'unknown',
+  sensorName: row.sensorName ?? 'Unknown Sensor',
+});
+
+export const listRecentSandboxAnalyses = (limit = 25, sensorId = null) =>
+  db.prepare(`
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, provider, verdict, summary, score,
+           file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
+           traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
+           error_message AS errorMessage, signatures_json AS signaturesJson, sensor_id AS sensorId, sensor_name AS sensorName
+    FROM sandbox_analyses
+    ${buildSensorFilterSql(sensorId, 'sensor_id')}
+    ORDER BY created_at DESC
+    LIMIT @limit
+  `).all({ limit, sensorId }).map(mapSandboxAnalysisRow);
+
+export const getLatestSandboxAnalysisBySha256 = (sha256, provider) => {
+  const row = db.prepare(`
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, provider, verdict, summary, score,
+           file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
+           traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
+           error_message AS errorMessage, signatures_json AS signaturesJson, sensor_id AS sensorId, sensor_name AS sensorName
+    FROM sandbox_analyses
+    WHERE sha256 = @sha256 AND provider = @provider
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get({ sha256, provider });
+
+  return row ? mapSandboxAnalysisRow(row) : null;
 };
 
 export const listPcapArtifacts = (limit = 50, sensorId = null) =>

@@ -6,6 +6,7 @@ import {
   LogEntry,
   MetricSnapshot,
   PcapArtifact,
+  SandboxAnalysisSummary,
   SensorSummary,
   ServerConfiguration,
   ThreatHuntingResponse,
@@ -149,6 +150,11 @@ export const getPcapArtifacts = async (baseUrl: string, limit = 50, sensorId?: s
     `${normalizeBaseUrl(baseUrl)}/api/pcap-artifacts?limit=${limit}${sensorId ? `&sensorId=${encodeURIComponent(sensorId)}` : ''}`
   );
 
+export const getSandboxAnalyses = async (baseUrl: string, limit = 25, sensorId?: string | null) =>
+  fetchJson<{ analyses: SandboxAnalysisSummary[] }>(
+    `${normalizeBaseUrl(baseUrl)}/api/sandbox/analyses?limit=${limit}${sensorId ? `&sensorId=${encodeURIComponent(sensorId)}` : ''}`
+  );
+
 export const listSensors = async (baseUrl: string) =>
   fetchJson<{ sensors: SensorSummary[] }>(`${normalizeBaseUrl(baseUrl)}/api/fleet/sensors`);
 
@@ -183,6 +189,23 @@ export const revealLocalPath = async (baseUrl: string, targetPath: string) =>
     },
     body: JSON.stringify({
       path: targetPath,
+    }),
+  });
+
+export const analyzeProcessFileInSandbox = async (
+  baseUrl: string,
+  targetPath: string,
+  options?: { processName?: string | null; trafficEventId?: string | null }
+) =>
+  fetchJson<{ ok: boolean; analysis: SandboxAnalysisSummary; error?: string; }>(`${normalizeBaseUrl(baseUrl)}/api/sandbox/analyze-process`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: targetPath,
+      processName: options?.processName || null,
+      trafficEventId: options?.trafficEventId || null,
     }),
   });
 

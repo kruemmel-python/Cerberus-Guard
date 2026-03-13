@@ -343,6 +343,60 @@ export const Settings: React.FC<SettingsProps> = ({
           </div>
         </SectionCard>
 
+        <SectionCard title={t('settingsSandbox')} description={t('settingsSandboxDescription')}>
+          <div className="space-y-4">
+            <ToggleField
+              label={t('sandboxEnabled')}
+              description={t('sandboxEnabledHint')}
+              checked={config.sandboxEnabled}
+              onChange={checked => setConfig(previousConfig => ({ ...previousConfig, sandboxEnabled: checked }))}
+            />
+            <ToggleField
+              label={t('sandboxAutoSubmitSuspicious')}
+              description={t('sandboxAutoSubmitSuspiciousHint')}
+              checked={config.sandboxAutoSubmitSuspicious}
+              onChange={checked => setConfig(previousConfig => ({ ...previousConfig, sandboxAutoSubmitSuspicious: checked }))}
+            />
+            <SelectInput
+              label={t('sandboxProvider')}
+              value={config.sandboxProvider}
+              onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxProvider: event.target.value as Configuration['sandboxProvider'] }))}
+            >
+              <option value="cape">CAPE Sandbox</option>
+              <option value="none">{t('sandboxProvider_none')}</option>
+            </SelectInput>
+            <TextInput
+              label={t('sandboxBaseUrl')}
+              value={config.sandboxBaseUrl}
+              onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxBaseUrl: event.target.value }))}
+              placeholder="http://localhost:8090"
+            />
+            <TextInput
+              label={t('sandboxApiKey')}
+              type="password"
+              value={config.sandboxApiKey}
+              onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxApiKey: event.target.value }))}
+              placeholder={t('sandboxApiKeyPlaceholder')}
+            />
+            <p className="text-xs text-gray-500">{t('sandboxApiKeyHint')}</p>
+            <div className="grid gap-4 md:grid-cols-2">
+              <TextInput
+                label={t('sandboxPollingIntervalMs')}
+                type="number"
+                value={config.sandboxPollingIntervalMs}
+                onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxPollingIntervalMs: Number.parseInt(event.target.value, 10) || 1000 }))}
+              />
+              <TextInput
+                label={t('sandboxTimeoutSeconds')}
+                type="number"
+                value={config.sandboxTimeoutSeconds}
+                onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxTimeoutSeconds: Number.parseInt(event.target.value, 10) || 60 }))}
+              />
+            </div>
+            <p className="text-xs text-gray-500">{t('sandboxProviderHint')}</p>
+          </div>
+        </SectionCard>
+
         <SectionCard title={t('settingsIntegrations')} description={t('webhookHint')}>
           <div className="flex items-center justify-between">
             <div className="text-sm text-gray-400">{t('webhookSummary', { count: config.webhookIntegrations.length })}</div>

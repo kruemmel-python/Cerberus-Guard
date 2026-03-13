@@ -1,6 +1,6 @@
-# NetGuard AI
+# Cerberus-Guard AI
 
-NetGuard AI now runs as a backend-driven IDS/IPS stack with:
+Cerberus-Guard AI now runs as a backend-driven IDS/IPS stack with:
 
 - real packet capture via `cap`/libpcap
 - backend-side heuristics, LLM batching, caching and persistence

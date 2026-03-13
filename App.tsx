@@ -1,0 +1,738 @@
+import React, { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Sidebar } from './components/Sidebar';
+import { Dashboard } from './components/Dashboard';
+import { Settings } from './components/Settings';
+import { Logs } from './components/Logs';
+import { RuleBuilder } from './components/RuleBuilder';
+import { FleetManagement } from './components/FleetManagement';
+import { ThreatHunter } from './components/ThreatHunter';
+import {
+  buildTrafficWebSocketUrl,
+  getBootstrap,
+  getBackendHealth,
+  listCaptureInterfaces,
+  startCapture,
+  startReplay,
+  stopCapture,
+  updateConfig,
+  getArtifactDownloadUrl,
+  refreshThreatIntel,
+} from './services/backendService';
+import { getProviderDefinition, getSelectedProviderSettings } from './services/llmProviders';
+import {
+  BackendWsMessage,
+  CaptureInterface,
+  CaptureStatusPayload,
+  Configuration,
+  FleetStatusPayload,
+  LogEntry,
+  LogLevel,
+  MetricSnapshot,
+  MonitoringStatus,
+  Packet,
+  PcapArtifact,
+  ReplayStatusPayload,
+  SensorSummary,
+  ThreatIntelStatus,
+  TrafficLogEntry,
+  TrafficMetricPoint,
+} from './types';
+import { useLocalization } from './hooks/useLocalization';
+import { createId, getInitialConfig, saveClientPreferences } from './utils';
+
+const MAX_LOG_ENTRIES = 500;
+const MAX_FEED_ENTRIES = 100;
+const MAX_ARTIFACT_ENTRIES = 50;
+const MAX_RAW_FEED_ENTRIES = 25;
+const CONFIG_SYNC_DELAY_MS = 700;
+const BACKEND_SWITCH_DELAY_MS = 500;
+const SOCKET_RECONNECT_DELAY_MS = 3000;
+
+type NavigationTab = 'Dashboard' | 'Rules' | 'Settings' | 'Logs' | 'Fleet' | 'ThreatHunt';
+type ConfigSyncState = 'idle' | 'saving' | 'saved' | 'error';
+
+const createInitialMetricSnapshot = (): MetricSnapshot => ({
+  packetsProcessed: 0,
+  threatsDetected: 0,
+  blockedDecisions: 0,
+  lastUpdatedAt: new Date(0).toISOString(),
+});
+
+const createEmptyReplayStatus = (): ReplayStatusPayload => ({
+  state: 'idle',
+  fileName: null,
+  processedPackets: 0,
+  totalPackets: 0,
+  startedAt: null,
+  completedAt: null,
+  message: null,
+});
+
+const createEmptyFleetStatus = (): FleetStatusPayload => ({
+  deploymentMode: 'standalone',
+  sensorId: 'local-sensor',
+  sensorName: 'Local Sensor',
+  connectedToHub: false,
+  connectedSensors: 0,
+  hubUrl: null,
+  lastSyncAt: null,
+  lastError: null,
+});
+
+const createEmptyThreatIntelStatus = (): ThreatIntelStatus => ({
+  enabled: false,
+  loadedIndicators: 0,
+  sourceCount: 0,
+  lastRefreshAt: null,
+  lastError: null,
+  refreshing: false,
+});
+
+const createInitialMonitoringStatus = (): MonitoringStatus => ({
+  backendReachable: false,
+  websocketConnected: false,
+  captureRunning: false,
+  activeDevice: null,
+  activeFilter: '',
+  lastStartedAt: null,
+  lastError: null,
+  replayStatus: createEmptyReplayStatus(),
+  fleetStatus: createEmptyFleetStatus(),
+  threatIntelStatus: createEmptyThreatIntelStatus(),
+});
+
+const mergeById = <T extends { id: string },>(items: T[], incomingItem: T, limit: number) =>
+  [incomingItem, ...items.filter(item => item.id !== incomingItem.id)].slice(0, limit);
+
+const serializeServerConfig = (config: Configuration) => {
+  const { backendBaseUrl: _backendBaseUrl, ...serverConfig } = config;
+  return JSON.stringify(serverConfig);
+};
+
+const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<NavigationTab>('Dashboard');
+  const [config, setConfig] = useState<Configuration>(getInitialConfig);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [liveTrafficFeed, setLiveTrafficFeed] = useState<TrafficLogEntry[]>([]);
+  const [rawPacketFeed, setRawPacketFeed] = useState<Packet[]>([]);
+  const [trafficMetrics, setTrafficMetrics] = useState<TrafficMetricPoint[]>([]);
+  const [artifacts, setArtifacts] = useState<PcapArtifact[]>([]);
+  const [availableInterfaces, setAvailableInterfaces] = useState<CaptureInterface[]>([]);
+  const [monitoringStatus, setMonitoringStatus] = useState<MonitoringStatus>(createInitialMonitoringStatus);
+  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricSnapshot>(createInitialMetricSnapshot);
+  const [captureActionPending, setCaptureActionPending] = useState(false);
+  const [replayActionPending, setReplayActionPending] = useState(false);
+  const [configSyncState, setConfigSyncState] = useState<ConfigSyncState>('idle');
+  const [sensors, setSensors] = useState<SensorSummary[]>([]);
+  const [selectedSensorId, setSelectedSensorId] = useState<string | null>(null);
+  const [threatIntelRefreshPending, setThreatIntelRefreshPending] = useState(false);
+  const { t } = useLocalization();
+
+  const websocketRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const configSyncTimerRef = useRef<number | null>(null);
+  const configSyncStateTimerRef = useRef<number | null>(null);
+  const bootstrapRequestIdRef = useRef(0);
+  const activeBaseUrlRef = useRef(config.backendBaseUrl);
+  const configRef = useRef(config);
+  const backendContextReadyRef = useRef(false);
+  const isDisposedRef = useRef(false);
+  const lastServerConfigRef = useRef(serializeServerConfig(config));
+  const selectedSensorIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    selectedSensorIdRef.current = selectedSensorId;
+  }, [selectedSensorId]);
+
+  const appendClientLog = useCallback((message: string, level: LogLevel, details?: Record<string, unknown>) => {
+    const entry: LogEntry = {
+      id: createId(),
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      details,
+    };
+
+    startTransition(() => {
+      setLogs(previousLogs => mergeById(previousLogs, entry, MAX_LOG_ENTRIES));
+    });
+  }, []);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const clearConfigSyncTimers = useCallback(() => {
+    if (configSyncTimerRef.current !== null) {
+      window.clearTimeout(configSyncTimerRef.current);
+      configSyncTimerRef.current = null;
+    }
+
+    if (configSyncStateTimerRef.current !== null) {
+      window.clearTimeout(configSyncStateTimerRef.current);
+      configSyncStateTimerRef.current = null;
+    }
+  }, []);
+
+  const closeTrafficSocket = useCallback(() => {
+    clearReconnectTimer();
+    if (websocketRef.current) {
+      websocketRef.current.onclose = null;
+      websocketRef.current.close();
+      websocketRef.current = null;
+    }
+  }, [clearReconnectTimer]);
+
+  const applyCaptureStatus = useCallback((status: CaptureStatusPayload) => {
+    setMonitoringStatus(previousStatus => ({
+      ...previousStatus,
+      backendReachable: true,
+      captureRunning: status.running,
+      activeDevice: status.activeDevice,
+      activeFilter: status.activeFilter,
+      lastStartedAt: status.startedAt,
+      lastError: null,
+    }));
+  }, []);
+
+  const hydrateFromBackend = useCallback(async (baseUrl: string, options?: { preserveRawFeed?: boolean; sensorId?: string | null }) => {
+    const requestId = ++bootstrapRequestIdRef.current;
+
+    try {
+      const payload = await getBootstrap(baseUrl, options?.sensorId ?? selectedSensorIdRef.current);
+      if (isDisposedRef.current || requestId !== bootstrapRequestIdRef.current || payload.config.backendBaseUrl !== activeBaseUrlRef.current) {
+        return;
+      }
+
+      backendContextReadyRef.current = true;
+      lastServerConfigRef.current = serializeServerConfig(payload.config);
+      setReplayActionPending(payload.replayStatus.state === 'running');
+
+      startTransition(() => {
+        setConfig(payload.config);
+        setAvailableInterfaces(payload.interfaces);
+        setLogs(payload.logs.slice(0, MAX_LOG_ENTRIES));
+        setLiveTrafficFeed(payload.traffic.slice(0, MAX_FEED_ENTRIES));
+        if (!options?.preserveRawFeed) {
+          setRawPacketFeed([]);
+        }
+        setTrafficMetrics(payload.metricSeries);
+        setArtifacts(payload.artifacts.slice(0, MAX_ARTIFACT_ENTRIES));
+        setMetricsSnapshot(payload.metrics);
+        setSensors(payload.sensors);
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          backendReachable: true,
+          captureRunning: payload.captureStatus.running,
+          activeDevice: payload.captureStatus.activeDevice,
+          activeFilter: payload.captureStatus.activeFilter,
+          lastStartedAt: payload.captureStatus.startedAt,
+          lastError: null,
+          replayStatus: payload.replayStatus,
+          fleetStatus: payload.fleetStatus,
+          threatIntelStatus: payload.threatIntelStatus,
+        }));
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: false,
+        lastError: message,
+      }));
+      appendClientLog(t('logBootstrapFailed'), LogLevel.ERROR, { error: message, baseUrl });
+    }
+  }, [appendClientLog, t]);
+
+  const handleSocketMessage = useCallback((message: BackendWsMessage) => {
+    const activeSensorFilter = selectedSensorIdRef.current;
+
+    switch (message.type) {
+      case 'capture-status':
+        applyCaptureStatus(message.payload);
+        setCaptureActionPending(false);
+        return;
+      case 'capture-error':
+        setCaptureActionPending(false);
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          backendReachable: true,
+          lastError: message.payload.message,
+        }));
+        appendClientLog(t('logCaptureError'), LogLevel.ERROR, { error: message.payload.message });
+        return;
+      case 'metrics-update':
+        if (!activeSensorFilter) {
+          setMetricsSnapshot(message.payload);
+        }
+        return;
+      case 'traffic-event':
+        if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
+          startTransition(() => {
+            setLiveTrafficFeed(previousFeed => mergeById(previousFeed, message.payload, MAX_FEED_ENTRIES));
+          });
+        }
+        return;
+      case 'threat-detected':
+        return;
+      case 'log-entry':
+        if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
+          startTransition(() => {
+            setLogs(previousLogs => mergeById(previousLogs, message.payload, MAX_LOG_ENTRIES));
+          });
+        }
+        return;
+      case 'raw-packet':
+        if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
+          startTransition(() => {
+            setRawPacketFeed(previousFeed => mergeById(previousFeed, message.payload, MAX_RAW_FEED_ENTRIES));
+          });
+        }
+        return;
+      case 'replay-status':
+        setReplayActionPending(message.payload.state === 'running');
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          replayStatus: message.payload,
+        }));
+        return;
+      case 'pcap-artifact':
+        if (!activeSensorFilter || message.payload.sensorId === activeSensorFilter) {
+          startTransition(() => {
+            setArtifacts(previousArtifacts => mergeById(previousArtifacts, message.payload, MAX_ARTIFACT_ENTRIES));
+          });
+        }
+        return;
+      case 'fleet-status':
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          fleetStatus: message.payload,
+        }));
+        return;
+      case 'sensor-update':
+        startTransition(() => {
+          setSensors(previousSensors => mergeById(previousSensors, message.payload, 200));
+        });
+        return;
+      case 'threat-intel-status':
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          threatIntelStatus: message.payload,
+        }));
+        setThreatIntelRefreshPending(message.payload.refreshing);
+        return;
+      default:
+        return;
+    }
+  }, [appendClientLog, applyCaptureStatus, t]);
+
+  const connectTrafficSocket = useCallback((baseUrl: string, refreshOnOpen = false) => {
+    const normalizedBaseUrl = baseUrl.trim() || 'http://localhost:8080';
+    let socketUrl: string;
+
+    try {
+      socketUrl = buildTrafficWebSocketUrl(normalizedBaseUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: false,
+        websocketConnected: false,
+        lastError: message,
+      }));
+      appendClientLog(t('logWebSocketError'), LogLevel.ERROR, { error: message, baseUrl: normalizedBaseUrl });
+      return;
+    }
+
+    closeTrafficSocket();
+
+    const socket = new WebSocket(socketUrl);
+    websocketRef.current = socket;
+
+    socket.onopen = () => {
+      clearReconnectTimer();
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: true,
+        websocketConnected: true,
+        lastError: null,
+      }));
+
+      if (refreshOnOpen) {
+        void hydrateFromBackend(normalizedBaseUrl, { preserveRawFeed: true, sensorId: selectedSensorIdRef.current });
+      }
+    };
+
+    socket.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data) as BackendWsMessage;
+        handleSocketMessage(message);
+      } catch (error) {
+        appendClientLog(t('logPacketDecodeFailed'), LogLevel.ERROR, {
+          error: error instanceof Error ? error.message : t('unknownError'),
+        });
+      }
+    };
+
+    socket.onerror = () => {
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        websocketConnected: false,
+        lastError: t('logWebSocketError'),
+      }));
+    };
+
+    socket.onclose = () => {
+      if (websocketRef.current === socket) {
+        websocketRef.current = null;
+      }
+
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        websocketConnected: false,
+      }));
+
+      if (isDisposedRef.current || activeBaseUrlRef.current !== normalizedBaseUrl || reconnectTimerRef.current !== null) {
+        return;
+      }
+
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (!isDisposedRef.current && activeBaseUrlRef.current === normalizedBaseUrl && !websocketRef.current) {
+          connectTrafficSocket(normalizedBaseUrl, true);
+        }
+      }, SOCKET_RECONNECT_DELAY_MS);
+    };
+  }, [appendClientLog, clearReconnectTimer, closeTrafficSocket, handleSocketMessage, hydrateFromBackend, t]);
+
+  const refreshInterfaces = useCallback(async (shouldReportErrors = false) => {
+    try {
+      const response = await listCaptureInterfaces(configRef.current.backendBaseUrl);
+      setAvailableInterfaces(response.interfaces);
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: true,
+        lastError: null,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: false,
+        lastError: message,
+      }));
+
+      if (shouldReportErrors) {
+        appendClientLog(t('logInterfacesRefreshFailed'), LogLevel.ERROR, { error: message });
+      }
+    }
+  }, [appendClientLog, t]);
+
+  const startMonitoring = useCallback(async () => {
+    setCaptureActionPending(true);
+
+    try {
+      const response = await startCapture(configRef.current);
+      applyCaptureStatus(response.status);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: false,
+        lastError: message,
+      }));
+      appendClientLog(t('logMonitoringStartFailed'), LogLevel.ERROR, { error: message });
+    } finally {
+      setCaptureActionPending(false);
+    }
+  }, [appendClientLog, applyCaptureStatus, t]);
+
+  const stopMonitoringGracefully = useCallback(async () => {
+    setCaptureActionPending(true);
+
+    try {
+      const response = await stopCapture(configRef.current.backendBaseUrl);
+      applyCaptureStatus(response.status);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        lastError: message,
+      }));
+      appendClientLog(t('logMonitoringStopFailed'), LogLevel.ERROR, { error: message });
+    } finally {
+      setCaptureActionPending(false);
+    }
+  }, [appendClientLog, applyCaptureStatus, t]);
+
+  const startReplayCapture = useCallback(async (file: File, speedMultiplier: number) => {
+    setReplayActionPending(true);
+
+    try {
+      await startReplay(configRef.current.backendBaseUrl, file, speedMultiplier);
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        backendReachable: true,
+        lastError: null,
+        replayStatus: {
+          ...previousStatus.replayStatus,
+          state: 'running',
+          fileName: file.name,
+          processedPackets: 0,
+          totalPackets: previousStatus.replayStatus.totalPackets,
+          startedAt: new Date().toISOString(),
+          completedAt: null,
+          message: null,
+        },
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        lastError: message,
+      }));
+      appendClientLog(t('logReplayStartFailed'), LogLevel.ERROR, { error: message, fileName: file.name });
+      setReplayActionPending(false);
+    }
+  }, [appendClientLog, t]);
+
+  const triggerThreatIntelRefresh = useCallback(async () => {
+    setThreatIntelRefreshPending(true);
+    try {
+      const response = await refreshThreatIntel(configRef.current.backendBaseUrl);
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        threatIntelStatus: response.status,
+        lastError: null,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('threatIntelRefreshFailed'), LogLevel.ERROR, { error: message });
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        lastError: message,
+      }));
+    } finally {
+      setThreatIntelRefreshPending(false);
+    }
+  }, [appendClientLog, t]);
+
+  useEffect(() => {
+    activeBaseUrlRef.current = config.backendBaseUrl.trim() || 'http://localhost:8080';
+    saveClientPreferences({ backendBaseUrl: activeBaseUrlRef.current });
+
+    backendContextReadyRef.current = false;
+    setMonitoringStatus(previousStatus => ({
+      ...previousStatus,
+      backendReachable: false,
+      websocketConnected: false,
+      lastError: null,
+    }));
+
+    const timeoutId = window.setTimeout(() => {
+      closeTrafficSocket();
+      void hydrateFromBackend(activeBaseUrlRef.current, { sensorId: selectedSensorIdRef.current });
+      connectTrafficSocket(activeBaseUrlRef.current);
+    }, BACKEND_SWITCH_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [config.backendBaseUrl, closeTrafficSocket, connectTrafficSocket, hydrateFromBackend]);
+
+  useEffect(() => {
+    if (!backendContextReadyRef.current) {
+      return;
+    }
+
+    const serializedConfig = serializeServerConfig(config);
+    if (serializedConfig === lastServerConfigRef.current) {
+      return;
+    }
+
+    clearConfigSyncTimers();
+    setConfigSyncState('saving');
+
+    configSyncTimerRef.current = window.setTimeout(() => {
+      void updateConfig(configRef.current).then(nextConfig => {
+        backendContextReadyRef.current = true;
+        lastServerConfigRef.current = serializeServerConfig(nextConfig);
+        startTransition(() => {
+          setConfig(nextConfig);
+        });
+        setConfigSyncState('saved');
+        configSyncStateTimerRef.current = window.setTimeout(() => {
+          setConfigSyncState('idle');
+          configSyncStateTimerRef.current = null;
+        }, 1500);
+      }).catch(error => {
+        const message = error instanceof Error ? error.message : t('unknownError');
+        setConfigSyncState('error');
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          lastError: message,
+        }));
+        appendClientLog(t('logConfigSyncFailed'), LogLevel.ERROR, { error: message });
+      }).finally(() => {
+        configSyncTimerRef.current = null;
+      });
+    }, CONFIG_SYNC_DELAY_MS);
+
+    return () => {
+      if (configSyncTimerRef.current !== null) {
+        window.clearTimeout(configSyncTimerRef.current);
+        configSyncTimerRef.current = null;
+      }
+    };
+  }, [appendClientLog, clearConfigSyncTimers, config, t]);
+
+  useEffect(() => {
+    if (!backendContextReadyRef.current) {
+      return;
+    }
+    void hydrateFromBackend(configRef.current.backendBaseUrl, { preserveRawFeed: true, sensorId: selectedSensorId });
+  }, [hydrateFromBackend, selectedSensorId]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void getBackendHealth(configRef.current.backendBaseUrl).then(() => {
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          backendReachable: true,
+        }));
+      }).catch(error => {
+        const message = error instanceof Error ? error.message : t('unknownError');
+        setMonitoringStatus(previousStatus => ({
+          ...previousStatus,
+          backendReachable: false,
+          lastError: previousStatus.websocketConnected ? previousStatus.lastError : message,
+        }));
+      });
+    }, 15000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [t]);
+
+  useEffect(() => () => {
+    isDisposedRef.current = true;
+    clearConfigSyncTimers();
+    closeTrafficSocket();
+  }, [clearConfigSyncTimers, closeTrafficSocket]);
+
+  const selectedProvider = getProviderDefinition(config.llmProvider);
+  const selectedProviderSettings = getSelectedProviderSettings(config);
+  const llmStatus = useMemo(
+    () => ({
+      loaded: monitoringStatus.backendReachable && Boolean(selectedProviderSettings.model),
+      model: `${selectedProvider.label} / ${selectedProviderSettings.model || selectedProvider.defaultModel}`,
+    }),
+    [monitoringStatus.backendReachable, selectedProvider, selectedProviderSettings.model]
+  );
+
+  const sensorScopedTraffic = useMemo(
+    () => (selectedSensorId ? liveTrafficFeed.filter(entry => entry.sensorId === selectedSensorId) : liveTrafficFeed),
+    [liveTrafficFeed, selectedSensorId]
+  );
+  const sensorScopedLogs = useMemo(
+    () => (selectedSensorId ? logs.filter(log => log.sensorId === selectedSensorId) : logs),
+    [logs, selectedSensorId]
+  );
+  const sensorScopedArtifacts = useMemo(
+    () => (selectedSensorId ? artifacts.filter(artifact => artifact.sensorId === selectedSensorId) : artifacts),
+    [artifacts, selectedSensorId]
+  );
+  const sensorScopedRawPackets = useMemo(
+    () => (selectedSensorId ? rawPacketFeed.filter(packet => packet.sensorId === selectedSensorId) : rawPacketFeed),
+    [rawPacketFeed, selectedSensorId]
+  );
+
+  const renderTab = () => {
+    switch (activeTab) {
+      case 'Dashboard':
+        return (
+          <Dashboard
+            isMonitoring={monitoringStatus.captureRunning}
+            captureActionPending={captureActionPending}
+            replayActionPending={replayActionPending}
+            onStartMonitoring={startMonitoring}
+            onStopMonitoring={stopMonitoringGracefully}
+            onStartReplay={startReplayCapture}
+            monitoringStatus={monitoringStatus}
+            llmStatus={llmStatus}
+            metricsSnapshot={metricsSnapshot}
+            liveTrafficFeed={sensorScopedTraffic}
+            rawPacketFeed={sensorScopedRawPackets}
+            trafficMetrics={trafficMetrics}
+            artifacts={sensorScopedArtifacts}
+            rawFeedEnabled={config.liveRawFeedEnabled}
+            getArtifactDownloadUrl={(artifactId) => getArtifactDownloadUrl(config.backendBaseUrl, artifactId)}
+            sensors={sensors}
+            selectedSensorId={selectedSensorId}
+            onSelectSensor={setSelectedSensorId}
+          />
+        );
+      case 'Rules':
+        return (
+          <RuleBuilder
+            config={config}
+            setConfig={setConfig}
+            configSyncState={configSyncState}
+          />
+        );
+      case 'Settings':
+        return (
+          <Settings
+            config={config}
+            setConfig={setConfig}
+            availableInterfaces={availableInterfaces}
+            monitoringStatus={monitoringStatus}
+            refreshInterfaces={() => refreshInterfaces(true)}
+            configSyncState={configSyncState}
+            onRefreshThreatIntel={triggerThreatIntelRefresh}
+            threatIntelRefreshPending={threatIntelRefreshPending}
+          />
+        );
+      case 'Logs':
+        return <Logs logs={sensorScopedLogs} sensors={sensors} selectedSensorId={selectedSensorId} onSelectSensor={setSelectedSensorId} />;
+      case 'Fleet':
+        return (
+          <FleetManagement
+            sensors={sensors}
+            fleetStatus={monitoringStatus.fleetStatus}
+            selectedSensorId={selectedSensorId}
+            onSelectSensor={setSelectedSensorId}
+          />
+        );
+      case 'ThreatHunt':
+        return (
+          <ThreatHunter
+            backendBaseUrl={config.backendBaseUrl}
+            selectedSensorId={selectedSensorId}
+            sensors={sensors}
+          />
+        );
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen bg-[#0D1117] text-gray-300 font-sans">
+      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+      <main className="flex-1 p-6 sm:p-8 lg:p-10">
+        {renderTab()}
+      </main>
+    </div>
+  );
+};
+
+export default App;

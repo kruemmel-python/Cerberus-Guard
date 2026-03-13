@@ -1,0 +1,6 @@
+{
+  "name": "NetGuard AI",
+  "description": "A sophisticated web application that simulates a local network security monitoring tool. It features a real-time traffic feed, uses the Gemini API to emulate an LLM for threat detection, and provides a comprehensive UI for configuration, alerts, and logging.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}

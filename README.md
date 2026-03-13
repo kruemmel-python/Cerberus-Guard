@@ -1,4 +1,5 @@
 # Cerberus Guard AI
+<img width="2752" height="1536" alt="image" src="https://github.com/user-attachments/assets/ffc26983-d13c-4776-817d-9e5d40060b88" />
 
 Cerberus Guard AI now runs as a backend-driven IDS/IPS stack with:
 

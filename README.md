@@ -1,6 +1,6 @@
-# Cerberus-Guard AI
+# Cerberus Guard AI
 
-Cerberus-Guard AI now runs as a backend-driven IDS/IPS stack with:
+Cerberus Guard AI now runs as a backend-driven IDS/IPS stack with:
 
 - real packet capture via `cap`/libpcap
 - backend-side heuristics, LLM batching, caching and persistence
@@ -40,7 +40,7 @@ Cerberus-Guard AI now runs as a backend-driven IDS/IPS stack with:
    `npm run dev`
 4. Open the UI and configure:
    `Deployment Mode`: `standalone` for one node, `hub` for central management, `agent` to join a hub
-   `Backend Base URL`: `http://localhost:8080`
+   `Backend Base URL`: `http://localhost:8081`
    `Capture Interface`: your real network adapter
    `Capture Filter`: for example `ip and (tcp or udp)`
    `Payload Privacy Mode`: `Raw payload for local LLMs only` is recommended for LM Studio/Ollama; use `Strict masking` for cloud LLMs
@@ -70,8 +70,8 @@ Cerberus-Guard AI now runs as a backend-driven IDS/IPS stack with:
 - `GET /api/threat-intel/status`
 - `POST /api/threat-intel/refresh`
 - `POST /api/forensics/chat`
-- WebSocket stream: `ws://localhost:8080/traffic`
-- Agent fleet WebSocket: `ws://localhost:8080/fleet/agent`
+- WebSocket stream: `ws://localhost:8081/traffic`
+- Agent fleet WebSocket: `ws://localhost:8081/fleet/agent`
 
 ## Distributed mode
 
@@ -84,11 +84,11 @@ To connect an agent to a hub:
 1. Set the hub node to `Deployment Mode = hub`
 2. Set the same `Shared Fleet Token` on hub and agent
 3. On the agent, set `Deployment Mode = agent`
-4. On the agent, set `Hub URL` to the hub backend, for example `http://10.0.0.5:8080`
+4. On the agent, set `Hub URL` to the hub backend, for example `http://10.0.0.5:8081`
 
 ## Threat intelligence
 
-NetGuard can load remote plain-text, Spamhaus DROP-style or JSON-array feeds into the backend and match IP/CIDR indicators before heuristics and LLM inspection. Feed refresh is configured in `Settings -> Threat Intelligence`.
+Cerberus Guard can load remote plain-text, Spamhaus DROP-style or JSON-array feeds into the backend and match IP/CIDR indicators before heuristics and LLM inspection. Feed refresh is configured in `Settings -> Threat Intelligence`.
 
 ## Threat hunting
 

@@ -30,6 +30,7 @@ interface DashboardProps {
   onStartMonitoring: () => void;
   onStopMonitoring: () => void;
   onStartReplay: (file: File, speedMultiplier: number) => Promise<void>;
+  onRevealProcessPath: (targetPath: string) => Promise<void>;
   monitoringStatus: MonitoringStatus;
   llmStatus: { loaded: boolean; model: string };
   metricsSnapshot: MetricSnapshot;
@@ -43,6 +44,40 @@ interface DashboardProps {
   selectedSensorId: string | null;
   onSelectSensor: (sensorId: string | null) => void;
 }
+
+const normalizeSearchValue = (value: string) => value.trim().toLowerCase();
+
+const buildProcessSearchIndex = (entry: TrafficLogEntry) => {
+  const localProcess = entry.packet.localProcess;
+  if (!localProcess) {
+    return '';
+  }
+
+  const serviceNames = localProcess.services.flatMap(service => [service.name, service.displayName, service.state]);
+  return [
+    localProcess.name,
+    localProcess.executablePath,
+    localProcess.commandLine,
+    localProcess.companyName,
+    localProcess.fileDescription,
+    localProcess.signatureStatus,
+    localProcess.signerSubject,
+    localProcess.pid !== null ? String(localProcess.pid) : null,
+    ...serviceNames,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+};
+
+const matchesProcessFilter = (entry: TrafficLogEntry, filterValue: string) => {
+  const normalizedFilter = normalizeSearchValue(filterValue);
+  if (!normalizedFilter) {
+    return true;
+  }
+
+  return buildProcessSearchIndex(entry).includes(normalizedFilter);
+};
 
 const getAttackTypeClass = (attackType: AttackType): string => {
   switch (attackType) {
@@ -122,10 +157,26 @@ const ReplayStatusBadge: React.FC<{ monitoringStatus: MonitoringStatus }> = ({ m
   );
 };
 
-const TrafficRow: React.FC<{ entry: TrafficLogEntry; getArtifactDownloadUrl: (artifactId: string) => string }> = ({ entry, getArtifactDownloadUrl }) => {
+const TrafficRow: React.FC<{
+  entry: TrafficLogEntry;
+  getArtifactDownloadUrl: (artifactId: string) => string;
+  onFilterByProcess: (value: string) => void;
+  onCopyProcessPath: (targetPath: string) => Promise<void>;
+  onRevealProcessPath: (targetPath: string) => Promise<void>;
+}> = ({
+  entry,
+  getArtifactDownloadUrl,
+  onFilterByProcess,
+  onCopyProcessPath,
+  onRevealProcessPath,
+}) => {
   const { packet, attackType, confidence, action, explanation, decisionSource, pcapArtifactId, firewallApplied } = entry;
   const { t } = useLocalization();
   const layer7Protocol = packet.l7Protocol || 'UNKNOWN';
+  const localProcess = packet.localProcess;
+  const processTitle = localProcess
+    ? [localProcess.executablePath, localProcess.commandLine].filter(Boolean).join('\n')
+    : '';
 
   return (
     <tr className="border-b border-gray-700/40 bg-[#161B22] text-sm hover:bg-[#1a212c]">
@@ -134,7 +185,12 @@ const TrafficRow: React.FC<{ entry: TrafficLogEntry; getArtifactDownloadUrl: (ar
         <div className="font-mono text-cyan-300 whitespace-nowrap">{packet.sourceIp}</div>
         <div className="text-[11px] text-gray-500">{entry.sensorName}</div>
       </td>
-      <td className="p-3 font-mono text-purple-300 whitespace-nowrap">{packet.destinationPort}</td>
+      <td className="p-3 font-mono text-purple-300 whitespace-nowrap">
+        <div>{packet.destinationPort}</div>
+        {localProcess && localProcess.localPort !== packet.destinationPort && (
+          <div className="mt-1 text-[11px] text-gray-500">{t('processLocalPort')}: {localProcess.localPort}</div>
+        )}
+      </td>
       <td className="p-3 whitespace-nowrap">
         <div className="inline-flex items-center rounded-full bg-slate-800 px-2 py-1 text-xs font-semibold text-slate-200">
           {packet.protocol}
@@ -145,6 +201,80 @@ const TrafficRow: React.FC<{ entry: TrafficLogEntry; getArtifactDownloadUrl: (ar
       </td>
       <td className={`p-3 whitespace-nowrap ${getAttackTypeClass(attackType)}`}>{attackType.replace(/_/g, ' ').toUpperCase()}</td>
       <td className="p-3 whitespace-nowrap text-gray-300">{confidence.toFixed(2)}</td>
+      <td className="p-3 max-w-sm text-gray-300" title={processTitle}>
+        {localProcess ? (
+          <>
+            <div className="font-medium text-gray-100">
+              {localProcess.name || t('processUnknown')}
+              {localProcess.pid !== null ? ` (PID ${localProcess.pid})` : ''}
+            </div>
+            {(localProcess.companyName || localProcess.fileDescription) && (
+              <div className="mt-1 text-[11px] text-gray-400">
+                <span className="font-semibold text-gray-300">{t('processCompany')}:</span>{' '}
+                {[localProcess.companyName, localProcess.fileDescription].filter(Boolean).join(' • ')}
+              </div>
+            )}
+            {localProcess.signatureStatus && (
+              <div className="mt-1 text-[11px] text-gray-400">
+                <span className="font-semibold text-gray-300">{t('processSignature')}:</span>{' '}
+                {localProcess.signatureStatus}
+                {localProcess.signerSubject ? ` • ${localProcess.signerSubject}` : ''}
+              </div>
+            )}
+            {localProcess.services.length > 0 && (
+              <div className="mt-1 text-[11px] text-gray-400">
+                <span className="font-semibold text-gray-300">{t('processServices')}:</span>{' '}
+                {localProcess.services
+                  .map(service => service.displayName || service.name)
+                  .filter(Boolean)
+                  .join(', ')}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (localProcess.executablePath) {
+                  void onCopyProcessPath(localProcess.executablePath);
+                }
+              }}
+              className="mt-1 block max-w-full truncate text-left text-[11px] text-blue-300 transition hover:text-blue-200"
+              title={localProcess.executablePath || t('processPathUnavailable')}
+              disabled={!localProcess.executablePath}
+            >
+              {localProcess.executablePath || t('processPathUnavailable')}
+            </button>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => onFilterByProcess(localProcess.name || localProcess.executablePath || String(localProcess.pid ?? ''))}
+                className="rounded-md border border-gray-600 px-2 py-1 text-[11px] font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
+              >
+                {t('processFilterButton')}
+              </button>
+              {localProcess.executablePath && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void onCopyProcessPath(localProcess.executablePath!)}
+                    className="rounded-md border border-gray-600 px-2 py-1 text-[11px] font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
+                  >
+                    {t('processCopyPath')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onRevealProcessPath(localProcess.executablePath!)}
+                    className="rounded-md border border-gray-600 px-2 py-1 text-[11px] font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white"
+                  >
+                    {t('processOpenFolder')}
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        ) : (
+          <span className="text-gray-500">{t('processUnavailable')}</span>
+        )}
+      </td>
       <td className="p-3 whitespace-nowrap">
         <span className={`inline-flex rounded-full px-2 py-1 text-xs font-semibold ${getActionClass(entry.actionType)}`}>
           {action}
@@ -198,6 +328,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onStartMonitoring,
   onStopMonitoring,
   onStartReplay,
+  onRevealProcessPath,
   monitoringStatus,
   llmStatus,
   metricsSnapshot,
@@ -214,6 +345,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const { t } = useLocalization();
   const [selectedReplayFile, setSelectedReplayFile] = useState<File | null>(null);
   const [replaySpeed, setReplaySpeed] = useState(10);
+  const [processFilter, setProcessFilter] = useState('');
+  const [processActionState, setProcessActionState] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
 
   const chartData = useMemo(
     () => trafficMetrics.map(metric => ({
@@ -222,6 +355,44 @@ export const Dashboard: React.FC<DashboardProps> = ({
     })),
     [t, trafficMetrics]
   );
+  const filteredLiveTrafficFeed = useMemo(
+    () => liveTrafficFeed.filter(entry => matchesProcessFilter(entry, processFilter)),
+    [liveTrafficFeed, processFilter]
+  );
+
+  const handleCopyProcessPath = async (targetPath: string) => {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Clipboard API unavailable.');
+      }
+
+      await navigator.clipboard.writeText(targetPath);
+      setProcessActionState({
+        tone: 'success',
+        message: t('processActionCopied'),
+      });
+    } catch {
+      setProcessActionState({
+        tone: 'error',
+        message: t('processActionFailed'),
+      });
+    }
+  };
+
+  const handleRevealProcessPath = async (targetPath: string) => {
+    try {
+      await onRevealProcessPath(targetPath);
+      setProcessActionState({
+        tone: 'success',
+        message: t('processActionOpened'),
+      });
+    } catch {
+      setProcessActionState({
+        tone: 'error',
+        message: t('processActionFailed'),
+      });
+    }
+  };
 
   const handleReplaySubmit = async () => {
     if (!selectedReplayFile) {
@@ -471,7 +642,38 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
       <div className="overflow-hidden rounded-2xl border border-gray-700/60 bg-[#161B22] shadow-xl">
         <div className="border-b border-gray-700/50 p-4">
-          <h2 className="text-xl font-semibold text-white">{t('liveTrafficFeed')}</h2>
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div>
+              <h2 className="text-xl font-semibold text-white">{t('liveTrafficFeed')}</h2>
+            </div>
+            <div className="flex flex-col gap-3 xl:min-w-[30rem]">
+              <label className="text-xs font-semibold uppercase tracking-wide text-gray-400" htmlFor="process-filter">
+                {t('processFilterLabel')}
+              </label>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  id="process-filter"
+                  value={processFilter}
+                  onChange={event => setProcessFilter(event.target.value)}
+                  placeholder={t('processFilterPlaceholder')}
+                  className="w-full rounded-lg border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setProcessFilter('')}
+                  disabled={!processFilter}
+                  className="rounded-lg border border-gray-600 px-3 py-2 text-sm font-semibold text-gray-200 transition hover:border-blue-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t('processFilterClear')}
+                </button>
+              </div>
+              {processActionState && (
+                <div className={`text-xs ${processActionState.tone === 'success' ? 'text-emerald-300' : 'text-red-300'}`}>
+                  {processActionState.message}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -484,6 +686,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   'colProtocol',
                   'colAttackType',
                   'colConfidence',
+                  'colProcess',
                   'colAction',
                   'colDecisionSource',
                   'colLlmExplanation',
@@ -495,14 +698,25 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700/50">
-              {liveTrafficFeed.length > 0 ? (
-                liveTrafficFeed.map(entry => (
-                  <TrafficRow key={entry.id} entry={entry} getArtifactDownloadUrl={getArtifactDownloadUrl} />
+              {filteredLiveTrafficFeed.length > 0 ? (
+                filteredLiveTrafficFeed.map(entry => (
+                  <TrafficRow
+                    key={entry.id}
+                    entry={entry}
+                    getArtifactDownloadUrl={getArtifactDownloadUrl}
+                    onFilterByProcess={setProcessFilter}
+                    onCopyProcessPath={handleCopyProcessPath}
+                    onRevealProcessPath={handleRevealProcessPath}
+                  />
                 ))
               ) : (
                 <tr>
-                  <td colSpan={9} className="p-8 text-center text-gray-500">
-                    {isMonitoring ? t('waitingForTraffic') : t('startMonitoringToSeeTraffic')}
+                  <td colSpan={10} className="p-8 text-center text-gray-500">
+                    {liveTrafficFeed.length > 0 && processFilter
+                      ? t('processNoFilterMatches')
+                      : isMonitoring
+                        ? t('waitingForTraffic')
+                        : t('startMonitoringToSeeTraffic')}
                   </td>
                 </tr>
               )}

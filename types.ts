@@ -10,6 +10,33 @@ export type PayloadMaskingMode = 'strict' | 'raw_local_only';
 
 export type ThreatIntelFeedFormat = 'plain' | 'spamhaus_drop' | 'json_array';
 
+export type ProcessResolutionStrategy = 'exact' | 'listener' | 'local_port' | 'unresolved';
+export type ProcessSignatureStatus = string;
+
+export interface LocalServiceInfo {
+  name: string;
+  displayName: string | null;
+  state: string | null;
+}
+
+export interface LocalProcessInfo {
+  pid: number | null;
+  name: string | null;
+  executablePath: string | null;
+  commandLine: string | null;
+  companyName: string | null;
+  fileDescription: string | null;
+  signatureStatus: ProcessSignatureStatus | null;
+  signerSubject: string | null;
+  services: LocalServiceInfo[];
+  localAddress: string | null;
+  localPort: number;
+  remoteAddress: string | null;
+  remotePort: number | null;
+  protocol: TransportProtocol;
+  resolution: ProcessResolutionStrategy;
+}
+
 export interface Packet {
   id: string;
   sourceIp: string;
@@ -24,6 +51,7 @@ export interface Packet {
   direction: PacketDirection;
   l7Protocol: Layer7Protocol;
   l7Metadata: Record<string, string>;
+  localProcess?: LocalProcessInfo | null;
   sensorId?: string;
   sensorName?: string;
 }

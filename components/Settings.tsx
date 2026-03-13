@@ -209,7 +209,7 @@ export const Settings: React.FC<SettingsProps> = ({
 
         <SectionCard title={t('settingsSensorConfig')} description={t('settingsSensorDescription')}>
           <div className="space-y-4">
-            <TextInput label={t('backendBaseUrl')} value={config.backendBaseUrl} onChange={event => setConfig(previousConfig => ({ ...previousConfig, backendBaseUrl: event.target.value }))} placeholder="http://localhost:8080" />
+            <TextInput label={t('backendBaseUrl')} value={config.backendBaseUrl} onChange={event => setConfig(previousConfig => ({ ...previousConfig, backendBaseUrl: event.target.value }))} placeholder="http://localhost:8081" />
             <div className="flex flex-wrap items-center gap-3 text-sm text-gray-400">
               <span>{monitoringStatus.backendReachable ? t('backendReachable') : t('backendUnreachable')}</span>
               <span>{monitoringStatus.websocketConnected ? t('streamConnected') : t('streamDisconnected')}</span>

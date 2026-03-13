@@ -2,8 +2,8 @@ import { WebSocket } from 'ws';
 
 const createFleetStatus = (config = {}) => ({
   deploymentMode: config.deploymentMode ?? 'standalone',
-  sensorId: config.sensorId ?? 'local-sensor',
-  sensorName: config.sensorName ?? 'Local Sensor',
+  sensorId: config.sensorId ?? 'desktop-lab-01',
+  sensorName: config.sensorName ?? 'Windows Lab Sensor',
   connectedToHub: false,
   connectedSensors: 0,
   hubUrl: config.hubUrl || null,

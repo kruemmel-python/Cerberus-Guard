@@ -16,7 +16,7 @@ import {
 } from './db.js';
 import { sanitizeConfigurationForClient } from './configStore.js';
 import { CaptureAgent } from './captureAgent.js';
-import { AnalysisCoordinator } from './analysisCoordinator.js';
+import { AnalysisCoordinator, AnalysisCoordinatorResetError } from './analysisCoordinator.js';
 import { HeuristicAnalyzer } from './heuristicAnalyzer.js';
 import { dispatchAlertWebhooks } from './webhookDispatcher.js';
 import { FirewallManager } from './firewallManager.js';
@@ -25,6 +25,7 @@ import { getProviderDefinition } from './llmProviders.js';
 import { ThreatIntelService } from './threatIntelService.js';
 import { FleetService } from './fleetService.js';
 import { ForensicsChatService } from './forensicsChatService.js';
+import { ProcessResolver } from './processResolver.js';
 
 const createId = () => crypto.randomUUID();
 
@@ -71,7 +72,7 @@ export class MonitoringService {
     };
     this.captureAgent = new CaptureAgent({
       onPacket: decodedPacket => {
-        void this.processDecodedPacket(decodedPacket, { source: 'live' });
+        void this.processDecodedPacketSafely(decodedPacket, { source: 'live' });
       },
       onStatus: status => {
         const payload = this.decorateCaptureStatus(status);
@@ -97,6 +98,13 @@ export class MonitoringService {
     this.firewallManager = new FirewallManager();
     this.pcapForensics = new PcapForensics();
     this.forensicsChatService = new ForensicsChatService();
+    this.processResolver = new ProcessResolver({
+      onError: error => {
+        this.emitLog('WARN', 'Local process resolution failed.', {
+          error: error instanceof Error ? error.message : 'Unknown process resolution error',
+        });
+      },
+    });
     this.threatIntelService = new ThreatIntelService({
       onStatusChange: status => {
         this.threatIntelStatus = status;
@@ -304,7 +312,7 @@ export class MonitoringService {
     this.analysisCoordinator.reset('Capture started.');
     this.heuristicAnalyzer.reset();
     this.pcapForensics.reset();
-    const status = this.captureAgent.start(payload, clientCount);
+    const status = await this.captureAgent.start(payload, clientCount);
     this.emitLog('INFO', 'Network monitoring started.', {
       device: status.activeDevice,
       filter: status.activeFilter,
@@ -353,7 +361,7 @@ export class MonitoringService {
           this.broadcast({ type: 'replay-status', payload: this.replayStatus });
         },
         onPacket: async decodedPacket => {
-          await this.processDecodedPacket(decodedPacket, { source: 'replay' });
+          await this.processDecodedPacketSafely(decodedPacket, { source: 'replay' });
         },
       });
       this.emitLog('INFO', 'Historical replay completed.', { fileName });
@@ -389,6 +397,7 @@ export class MonitoringService {
       sensorId: this.configuration.sensorId,
       sensorName: this.configuration.sensorName,
     };
+    packet.localProcess = await this.processResolver.resolvePacket(packet);
     delete packet.payloadBuffer;
 
     this.pcapForensics.rememberFrame({
@@ -417,6 +426,24 @@ export class MonitoringService {
       this.broadcast({
         type: 'threat-detected',
         payload: trafficEntry,
+      });
+    }
+  }
+
+  async processDecodedPacketSafely(decodedPacket, context) {
+    try {
+      await this.processDecodedPacket(decodedPacket, context);
+    } catch (error) {
+      if (error instanceof AnalysisCoordinatorResetError || error?.code === 'ANALYSIS_QUEUE_RESET') {
+        return;
+      }
+
+      this.emitLog('ERROR', 'Packet analysis failed.', {
+        error: error instanceof Error ? error.message : 'Unknown packet analysis error',
+        source: context.source,
+        packetId: decodedPacket?.packet?.id ?? null,
+        sourceIp: decodedPacket?.packet?.sourceIp ?? null,
+        destinationPort: decodedPacket?.packet?.destinationPort ?? null,
       });
     }
   }

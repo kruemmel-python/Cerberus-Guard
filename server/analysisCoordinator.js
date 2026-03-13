@@ -1,6 +1,14 @@
 import { LRUCache } from 'lru-cache';
 import { analyzeTrafficBatch } from './llmService.js';
 
+export class AnalysisCoordinatorResetError extends Error {
+  constructor(message = 'Analysis queue reset.') {
+    super(message);
+    this.name = 'AnalysisCoordinatorResetError';
+    this.code = 'ANALYSIS_QUEUE_RESET';
+  }
+}
+
 export class AnalysisCoordinator {
   constructor() {
     this.cache = new LRUCache({ max: 5000 });
@@ -11,8 +19,11 @@ export class AnalysisCoordinator {
     for (const queue of this.queues.values()) {
       if (queue.timer) {
         clearTimeout(queue.timer);
+        queue.timer = null;
       }
-      queue.items.forEach(item => item.reject(new Error(reason)));
+      const queuedItems = [...queue.items];
+      queue.items = [];
+      queuedItems.forEach(item => item.reject(new AnalysisCoordinatorResetError(reason)));
     }
     this.queues.clear();
     this.cache.clear();

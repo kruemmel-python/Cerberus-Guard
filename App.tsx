@@ -11,6 +11,7 @@ import {
   getBootstrap,
   getBackendHealth,
   listCaptureInterfaces,
+  revealLocalPath,
   startCapture,
   startReplay,
   stopCapture,
@@ -70,8 +71,8 @@ const createEmptyReplayStatus = (): ReplayStatusPayload => ({
 
 const createEmptyFleetStatus = (): FleetStatusPayload => ({
   deploymentMode: 'standalone',
-  sensorId: 'local-sensor',
-  sensorName: 'Local Sensor',
+  sensorId: 'desktop-lab-01',
+  sensorName: 'Windows Lab Sensor',
   connectedToHub: false,
   connectedSensors: 0,
   hubUrl: null,
@@ -334,7 +335,7 @@ const App: React.FC = () => {
   }, [appendClientLog, applyCaptureStatus, t]);
 
   const connectTrafficSocket = useCallback((baseUrl: string, refreshOnOpen = false) => {
-    const normalizedBaseUrl = baseUrl.trim() || 'http://localhost:8080';
+    const normalizedBaseUrl = baseUrl.trim() || 'http://localhost:8081';
     let socketUrl: string;
 
     try {
@@ -524,8 +525,18 @@ const App: React.FC = () => {
     }
   }, [appendClientLog, t]);
 
+  const revealProcessPath = useCallback(async (targetPath: string) => {
+    try {
+      await revealLocalPath(configRef.current.backendBaseUrl, targetPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('processActionFailed'), LogLevel.ERROR, { error: message, targetPath });
+      throw error;
+    }
+  }, [appendClientLog, t]);
+
   useEffect(() => {
-    activeBaseUrlRef.current = config.backendBaseUrl.trim() || 'http://localhost:8080';
+    activeBaseUrlRef.current = config.backendBaseUrl.trim() || 'http://localhost:8081';
     saveClientPreferences({ backendBaseUrl: activeBaseUrlRef.current });
 
     backendContextReadyRef.current = false;
@@ -666,6 +677,7 @@ const App: React.FC = () => {
             onStartMonitoring={startMonitoring}
             onStopMonitoring={stopMonitoringGracefully}
             onStartReplay={startReplayCapture}
+            onRevealProcessPath={revealProcessPath}
             monitoringStatus={monitoringStatus}
             llmStatus={llmStatus}
             metricsSnapshot={metricsSnapshot}

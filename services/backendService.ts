@@ -16,7 +16,7 @@ import {
 
 const normalizeBaseUrl = (baseUrl: string) => {
   const trimmed = baseUrl.trim();
-  return trimmed.replace(/\/+$/, '') || 'http://localhost:8080';
+  return trimmed.replace(/\/+$/, '') || 'http://localhost:8081';
 };
 
 const toClientConfiguration = (config: ServerConfiguration, baseUrl: string): Configuration => ({
@@ -172,6 +172,17 @@ export const runThreatHunt = async (baseUrl: string, question: string, sensorId?
     body: JSON.stringify({
       question,
       sensorId: sensorId || null,
+    }),
+  });
+
+export const revealLocalPath = async (baseUrl: string, targetPath: string) =>
+  fetchJson<{ ok: boolean; revealedPath: string }>(`${normalizeBaseUrl(baseUrl)}/api/local-process/open-path`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      path: targetPath,
     }),
   });
 

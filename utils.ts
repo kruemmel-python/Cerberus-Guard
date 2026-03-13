@@ -2,7 +2,8 @@ import { Configuration, ThreatIntelSource } from './types';
 import { createDefaultProviderSettings } from './services/llmProviders';
 
 const CLIENT_PREFERENCES_KEY = 'cerberusClientPreferences';
-const DEFAULT_BACKEND_BASE_URL = 'http://localhost:8080';
+const DEFAULT_BACKEND_BASE_URL = 'http://localhost:8081';
+const LEGACY_BACKEND_BASE_URL = 'http://localhost:8080';
 
 const createDefaultThreatIntelSources = (): ThreatIntelSource[] => [
   {
@@ -24,12 +25,12 @@ const createDefaultThreatIntelSources = (): ThreatIntelSource[] => [
 export const createId = () => crypto.randomUUID();
 
 const createDefaultConfig = (backendBaseUrl: string): Configuration => ({
-  llmProvider: 'gemini',
+  llmProvider: 'lmstudio',
   providerSettings: createDefaultProviderSettings(),
   backendBaseUrl,
   deploymentMode: 'standalone',
-  sensorId: 'local-sensor',
-  sensorName: 'Local Sensor',
+  sensorId: 'desktop-lab-01',
+  sensorName: 'Windows Lab Sensor',
   hubUrl: '',
   fleetSharedToken: '',
   globalBlockPropagationEnabled: false,
@@ -48,7 +49,7 @@ const createDefaultConfig = (backendBaseUrl: string): Configuration => ({
   payloadMaskingMode: 'raw_local_only',
   threatIntelEnabled: false,
   threatIntelRefreshHours: 24,
-  threatIntelAutoBlock: true,
+  threatIntelAutoBlock: false,
   threatIntelSources: createDefaultThreatIntelSources(),
   blockedIps: [],
   blockedPorts: [],
@@ -63,7 +64,10 @@ export const getInitialConfig = (): Configuration => {
     if (savedPreferences) {
       const parsed = JSON.parse(savedPreferences) as { backendBaseUrl?: unknown };
       if (typeof parsed.backendBaseUrl === 'string' && parsed.backendBaseUrl.trim()) {
-        return createDefaultConfig(parsed.backendBaseUrl.trim());
+        const normalizedBackendBaseUrl = parsed.backendBaseUrl.trim() === LEGACY_BACKEND_BASE_URL
+          ? DEFAULT_BACKEND_BASE_URL
+          : parsed.backendBaseUrl.trim();
+        return createDefaultConfig(normalizedBackendBaseUrl);
       }
     }
   } catch (error) {

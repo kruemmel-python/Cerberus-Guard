@@ -1,4 +1,4 @@
-# NetGuard AI mit LM Studio nutzen
+# Cerberus Guard AI mit LM Studio nutzen
 
 Diese Anleitung zeigt eine komplette Beispiel-Konfiguration, mit der du eine echte Ueberwachung mit einem lokalen LM-Studio-Modell einrichtest und startest.
 
@@ -7,7 +7,7 @@ Diese Anleitung zeigt eine komplette Beispiel-Konfiguration, mit der du eine ech
 Wir bauen eine lokale Ueberwachung mit:
 
 - Frontend unter `http://localhost:5173`
-- NetGuard-Backend unter `http://localhost:8080`
+- Cerberus Guard-Backend unter `http://localhost:8081`
 - LM Studio als lokaler LLM-Provider unter `http://localhost:1234/v1`
 - echtem Netzwerk-Capture ueber Npcap/libpcap
 
@@ -28,10 +28,12 @@ Vor dem Start muss folgendes vorhanden sein:
 1. `Node.js` ist installiert.
 2. Unter Windows ist `Npcap` installiert, inklusive `WinPcap compatibility mode`.
 3. LM Studio ist installiert.
-4. In LM Studio ist ein Modell heruntergeladen, zum Beispiel:
-   - `qwen2.5-7b-instruct`
-   - `llama-3.1-8b-instruct`
-   - ein anderes chatfaehiges lokales Modell
+4. In LM Studio ist ein Modell heruntergeladen.
+5. Der lokale OpenAI-kompatible Server in LM Studio ist aktiv.
+
+Hinweis:
+Cerberus Guard startet bewusst mit der LM-Studio-Standard-Modell-ID `local-model`.
+Diese Default-ID bleibt so gesetzt. Wenn LM Studio bei dir eine andere Modell-ID anzeigt, kannst du sie spaeter in `Settings` manuell ersetzen.
 
 ## 1. LM Studio vorbereiten
 
@@ -45,18 +47,21 @@ Vor dem Start muss folgendes vorhanden sein:
 http://localhost:1234/v1
 ```
 
-6. Merke dir die Modell-ID genau so, wie LM Studio sie anzeigt.
+6. Pruefe die Modell-ID.
 
-Beispiel:
+Standard in Cerberus Guard:
 
 ```text
-qwen2.5-7b-instruct
+local-model
 ```
 
-Hinweis:
-NetGuard erwartet bei LM Studio keine API-Keys. Wichtig sind nur `Base URL` und `Model ID`.
+Wenn LM Studio bei dir exakt `local-model` bereitstellt, musst du nichts aendern.
+Wenn LM Studio eine andere Modell-ID liefert, uebernimm exakt diesen Wert spaeter in `Settings`.
 
-## 2. NetGuard starten
+Hinweis:
+Cerberus Guard erwartet bei LM Studio keine API-Keys. Wichtig sind nur `Base URL` und `Model ID`.
+
+## 2. Cerberus Guard starten
 
 Im Projektordner:
 
@@ -68,9 +73,9 @@ npm run dev
 Danach:
 
 - Frontend: `http://localhost:5173`
-- Backend: `http://localhost:8080`
+- Backend: `http://localhost:8081`
 
-## 3. Beispiel-Konfiguration in NetGuard
+## 3. Beispiel-Konfiguration in Cerberus Guard
 
 Oeffne `http://localhost:5173` und gehe in den Tab `Settings`.
 
@@ -84,7 +89,7 @@ Verwende fuer den ersten echten Test diese Werte.
 - `Hub URL`: leer
 - `Shared Fleet Token`: leer
 - `Global block propagation`: `aus`
-- `Backend Base URL`: `http://localhost:8080`
+- `Backend Base URL`: `http://localhost:8081`
 - `Capture Interface`: dein echtes Netzwerk-Interface
 - `Capture Filter`: `ip and (tcp or udp)`
 - `Live raw feed`: `aus` fuer den ersten Test
@@ -101,11 +106,12 @@ Wenn du unsicher bist:
 ### LLM Configuration
 
 - `LLM Provider`: `LM Studio`
-- `Model ID`: `qwen2.5-7b-instruct`
+- `Model ID`: `local-model`
 - `Base URL`: `http://localhost:1234/v1`
 - `Payload Privacy Mode`: `Raw payload for local LLMs only`
 
 Wenn deine Modell-ID in LM Studio anders heisst, trage exakt diesen Namen ein.
+Die Startkonfiguration von Cerberus Guard bleibt trotzdem absichtlich `local-model`.
 
 Warum genau diese Einstellung?
 
@@ -161,12 +167,12 @@ Fuer den ersten Test:
 Wenn alles korrekt gesetzt ist, sieht dein praktisches Beispiel so aus:
 
 ```text
-Backend Base URL:        http://localhost:8080
+Backend Base URL:        http://localhost:8081
 Capture Interface:       Dein WLAN- oder Ethernet-Adapter
 Capture Filter:          ip and (tcp or udp)
 
 LLM Provider:            LM Studio
-Model ID:                qwen2.5-7b-instruct
+Model ID:                local-model
 Base URL:                http://localhost:1234/v1
 
 Cache TTL:               60
@@ -314,7 +320,7 @@ Dann:
 2. Klicke `Refresh Feeds`
 3. Pruefe, ob `indicators loaded` groesser als `0` ist
 
-Damit blockt NetGuard bekannte boesartige IPs bereits vor Heuristik und vor LLM-Analyse.
+Damit blockt Cerberus Guard bekannte boesartige IPs bereits vor Heuristik und vor LLM-Analyse.
 
 ## 12. Fleet-Modus spaeter erweitern
 
@@ -360,10 +366,10 @@ Wenn du nur die Minimalversion willst:
 2. Modell laden
 3. LM-Studio-Server starten
 4. `npm run dev`
-5. In NetGuard:
-   - Backend: `http://localhost:8080`
+5. In Cerberus Guard:
+   - Backend: `http://localhost:8081`
    - Provider: `LM Studio`
-   - Modell: deine LM-Studio-Modell-ID
+   - Modell: `local-model`
    - Base URL: `http://localhost:1234/v1`
    - richtiges Netzwerk-Interface waehlen
 6. `Start Monitoring`

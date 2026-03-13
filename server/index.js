@@ -16,8 +16,9 @@ import {
   getTrafficCounters,
 } from './db.js';
 import { MonitoringService } from './monitoringService.js';
+import { revealLocalPath } from './localPathService.js';
 
-const PORT = Number(process.env.NETGUARD_SERVER_PORT || 8080);
+const PORT = Number(process.env.NETGUARD_SERVER_PORT || 8081);
 const app = express();
 const server = http.createServer(app);
 const wsClients = new Set();
@@ -41,6 +42,9 @@ const replaySchema = z.object({
 const forensicsSchema = z.object({
   question: z.string().trim().min(5),
   sensorId: z.string().trim().optional().nullable(),
+});
+const openLocalPathSchema = z.object({
+  path: z.string().trim().min(1),
 });
 
 app.use(express.json({ limit: '2mb' }));
@@ -269,6 +273,22 @@ app.post('/api/forensics/chat', async (request, response) => {
     response.status(400).json({
       ok: false,
       error: error instanceof Error ? error.message : 'Threat hunting request failed.',
+    });
+  }
+});
+
+app.post('/api/local-process/open-path', async (request, response) => {
+  try {
+    const payload = openLocalPathSchema.parse(request.body);
+    const revealedPath = await revealLocalPath(payload.path);
+    response.json({
+      ok: true,
+      revealedPath,
+    });
+  } catch (error) {
+    response.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Failed to open local path.',
     });
   }
 });

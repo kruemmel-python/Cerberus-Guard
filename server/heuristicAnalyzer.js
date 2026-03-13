@@ -7,7 +7,9 @@ const PORT_SCAN_PORT_THRESHOLD = 12;
 const BRUTE_FORCE_WINDOW_MS = 30_000;
 const BRUTE_FORCE_ATTEMPTS = 16;
 
-const AUTH_PORTS = new Set([21, 22, 23, 25, 110, 143, 443, 445, 587, 993, 995, 1433, 1521, 3306, 3389, 5432]);
+const SENSITIVE_PORTS = new Set([21, 22, 23, 25, 110, 143, 443, 445, 587, 993, 995, 1433, 1521, 3306, 3389, 5432]);
+const BRUTE_FORCE_PORTS = new Set([21, 22, 23, 25, 110, 143, 587, 993, 995, 1433, 1521, 3306, 3389, 5432]);
+const BRUTE_FORCE_L7_PROTOCOLS = new Set(['SSH', 'FTP', 'RDP', 'SQL']);
 const COMMON_BENIGN_PORTS = new Set([53, 80, 123, 443, 853]);
 const MALICIOUS_KEYWORDS = [
   'powershell',
@@ -36,6 +38,17 @@ const decodeHexSnippet = (hexValue) => {
 };
 
 const prune = (timestamps, cutoff) => timestamps.filter(timestamp => timestamp >= cutoff);
+
+const pruneAttemptsByTarget = (attemptsByTarget, cutoff) => {
+  for (const [targetKey, timestamps] of attemptsByTarget.entries()) {
+    const prunedTimestamps = prune(timestamps, cutoff);
+    if (prunedTimestamps.length === 0) {
+      attemptsByTarget.delete(targetKey);
+      continue;
+    }
+    attemptsByTarget.set(targetKey, prunedTimestamps);
+  }
+};
 
 const buildResult = (packet, overrides = {}) => ({
   isSuspicious: false,
@@ -139,7 +152,7 @@ export class HeuristicAnalyzer {
 
     const nextState = {
       packetTimestamps: [],
-      authAttempts: [],
+      authAttemptsByTarget: new Map(),
       portTouches: [],
     };
     this.sourceState.set(sourceIp, nextState);
@@ -175,18 +188,30 @@ export class HeuristicAnalyzer {
     const now = Date.parse(packet.timestamp) || Date.now();
     const state = this.getSourceState(packet.sourceIp);
     const payloadText = decodeHexSnippet(packet.payloadSnippet);
+    const bruteForceCandidate = packet.protocol === 'TCP'
+      && packet.direction === 'INBOUND'
+      && (
+        BRUTE_FORCE_PORTS.has(packet.destinationPort)
+        || BRUTE_FORCE_L7_PROTOCOLS.has(packet.l7Protocol)
+      );
+    const bruteForceTargetKey = bruteForceCandidate
+      ? `${packet.destinationIp}:${packet.destinationPort}:${packet.l7Protocol}`
+      : null;
 
     state.packetTimestamps.push(now);
-    state.authAttempts = prune(state.authAttempts, now - BRUTE_FORCE_WINDOW_MS);
+    pruneAttemptsByTarget(state.authAttemptsByTarget, now - BRUTE_FORCE_WINDOW_MS);
     state.portTouches = state.portTouches.filter(entry => entry.timestamp >= now - PORT_SCAN_WINDOW_MS);
     state.packetTimestamps = prune(state.packetTimestamps, now - DDOS_WINDOW_MS);
     state.portTouches.push({ port: packet.destinationPort, timestamp: now });
 
-    if (AUTH_PORTS.has(packet.destinationPort)) {
-      state.authAttempts.push(now);
+    if (bruteForceTargetKey) {
+      const attempts = state.authAttemptsByTarget.get(bruteForceTargetKey) ?? [];
+      attempts.push(now);
+      state.authAttemptsByTarget.set(bruteForceTargetKey, attempts);
     }
 
     const uniqueTouchedPorts = new Set(state.portTouches.map(entry => entry.port));
+    const targetAttempts = bruteForceTargetKey ? state.authAttemptsByTarget.get(bruteForceTargetKey) ?? [] : [];
 
     if (state.packetTimestamps.length >= DDOS_PACKET_THRESHOLD) {
       return {
@@ -216,14 +241,14 @@ export class HeuristicAnalyzer {
       };
     }
 
-    if (state.authAttempts.length >= BRUTE_FORCE_ATTEMPTS) {
+    if (bruteForceTargetKey && targetAttempts.length >= BRUTE_FORCE_ATTEMPTS) {
       return {
         result: buildResult(packet, {
           isSuspicious: true,
           attackType: 'brute_force',
           confidence: 0.94,
-          explanation: 'Repeated authentication-oriented traffic suggests a brute-force attempt.',
-          matchedSignals: ['behavior.brute_force.repeated_auth'],
+          explanation: 'Repeated inbound authentication attempts against the same service suggest a brute-force attack.',
+          matchedSignals: ['behavior.brute_force.same_target_repeated_auth'],
           recommendedActionType: 'BLOCK',
         }),
         needsDeepInspection: false,
@@ -259,7 +284,7 @@ export class HeuristicAnalyzer {
       };
     }
 
-    const targetsSensitivePort = AUTH_PORTS.has(packet.destinationPort) || config.monitoringPorts.includes(packet.destinationPort);
+    const targetsSensitivePort = SENSITIVE_PORTS.has(packet.destinationPort) || config.monitoringPorts.includes(packet.destinationPort);
     const carriesInspectableMetadata = packet.l7Protocol !== 'UNKNOWN' || packet.payloadSnippet.length > 0;
     const isCommonBenignPort = COMMON_BENIGN_PORTS.has(packet.destinationPort);
 

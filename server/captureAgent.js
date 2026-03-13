@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
+import dgram from 'node:dgram';
 import capModule from 'cap';
 import { detectLayer7Metadata } from './decoders/index.js';
 
@@ -9,6 +10,32 @@ const { PROTOCOL } = decoders;
 const PACKET_BUFFER_SIZE = 65535;
 const LIBPCAP_BUFFER_SIZE = 10 * 1024 * 1024;
 const MAX_PAYLOAD_SNIPPET_BYTES = 64;
+const PRIMARY_ADDRESS_TIMEOUT_MS = 750;
+const DEVICE_DEPRIORITIZATION_PATTERNS = [
+  /loopback/i,
+  /hyper-v/i,
+  /wan miniport/i,
+  /wi-fi direct/i,
+  /bluetooth/i,
+  /virtual/i,
+  /npcap loopback/i,
+];
+const DEVICE_PREFERENCE_PATTERNS = [
+  /wi-?fi/i,
+  /\bwlan\b/i,
+  /ethernet/i,
+  /mediatek/i,
+  /intel/i,
+  /realtek/i,
+];
+
+const isLinkLocalAddress = (address) =>
+  address.startsWith('169.254.') || address.startsWith('fe80:');
+
+const isPreferredIpv4Address = (address) =>
+  /^\d+\.\d+\.\d+\.\d+$/.test(address)
+  && !address.startsWith('127.')
+  && !address.startsWith('169.254.');
 
 const getLocalAddresses = () =>
   new Set(
@@ -26,6 +53,132 @@ const normalizeDevice = (device) => ({
   addresses: Array.isArray(device.addresses) ? device.addresses.map(address => address.addr).filter(Boolean) : [],
   loopback: typeof device.flags === 'string' ? device.flags.includes('LOOPBACK') : false,
 });
+
+const getAddressCandidates = () => {
+  const candidates = [];
+
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const addressInfo of addresses ?? []) {
+      if (!addressInfo || addressInfo.internal) {
+        continue;
+      }
+
+      if (addressInfo.family === 'IPv4' && isPreferredIpv4Address(addressInfo.address)) {
+        candidates.push(addressInfo.address);
+      }
+    }
+  }
+
+  return [...new Set(candidates)];
+};
+
+const scoreDevice = (device, primaryAddress, addressCandidates) => {
+  const descriptor = `${device.description} ${device.name}`.toLowerCase();
+  const deviceAddresses = new Set(device.addresses.map(address => address.toLowerCase()));
+  let score = 0;
+
+  if (primaryAddress && deviceAddresses.has(primaryAddress.toLowerCase())) {
+    score += 500;
+  }
+
+  for (const candidate of addressCandidates) {
+    if (deviceAddresses.has(candidate.toLowerCase())) {
+      score += 150;
+    }
+  }
+
+  if (device.addresses.some(isPreferredIpv4Address)) {
+    score += 80;
+  }
+
+  if (device.addresses.some(address => isLinkLocalAddress(address.toLowerCase()))) {
+    score -= 40;
+  }
+
+  if (device.loopback) {
+    score -= 250;
+  }
+
+  if (DEVICE_PREFERENCE_PATTERNS.some(pattern => pattern.test(descriptor))) {
+    score += 60;
+  }
+
+  if (DEVICE_DEPRIORITIZATION_PATTERNS.some(pattern => pattern.test(descriptor))) {
+    score -= 150;
+  }
+
+  return score;
+};
+
+const sortDevicesByPreference = (devices, primaryAddress = null) => {
+  const addressCandidates = getAddressCandidates();
+  return [...devices].sort((leftDevice, rightDevice) => {
+    const scoreDelta = scoreDevice(rightDevice, primaryAddress, addressCandidates) - scoreDevice(leftDevice, primaryAddress, addressCandidates);
+    if (scoreDelta !== 0) {
+      return scoreDelta;
+    }
+    return leftDevice.description.localeCompare(rightDevice.description);
+  });
+};
+
+const resolvePrimaryOutboundAddress = async () => {
+  const socket = dgram.createSocket('udp4');
+
+  try {
+    const connected = await Promise.race([
+      new Promise((resolve, reject) => {
+        socket.once('error', reject);
+        socket.connect(53, '1.1.1.1', resolve);
+      }),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Timed out while resolving primary network interface.')), PRIMARY_ADDRESS_TIMEOUT_MS);
+      }),
+    ]);
+
+    if (connected === undefined) {
+      const localSocket = socket.address();
+      if (typeof localSocket === 'object' && isPreferredIpv4Address(localSocket.address)) {
+        return localSocket.address;
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    try {
+      socket.close();
+    } catch {
+      // ignore socket close errors during interface probing
+    }
+  }
+
+  return null;
+};
+
+const resolveCaptureDevice = async (preferredDeviceName) => {
+  if (preferredDeviceName) {
+    return preferredDeviceName;
+  }
+
+  const primaryAddress = await resolvePrimaryOutboundAddress();
+  if (primaryAddress) {
+    try {
+      const deviceForPrimaryAddress = Cap.findDevice(primaryAddress);
+      if (deviceForPrimaryAddress) {
+        return deviceForPrimaryAddress;
+      }
+    } catch {
+      // fall through to heuristic device selection
+    }
+  }
+
+  const sortedDevices = sortDevicesByPreference(Cap.deviceList().map(normalizeDevice), primaryAddress);
+  const [bestDevice] = sortedDevices;
+  if (bestDevice?.name) {
+    return bestDevice.name;
+  }
+
+  return Cap.findDevice();
+};
 
 const getDirection = (localAddresses, sourceIp, destinationIp) => {
   if (localAddresses.has(sourceIp)) {
@@ -149,7 +302,7 @@ export class CaptureAgent {
 
   listInterfaces() {
     try {
-      return Cap.deviceList().map(normalizeDevice);
+      return sortDevicesByPreference(Cap.deviceList().map(normalizeDevice));
     } catch (error) {
       this.onError(error instanceof Error ? error : new Error('Failed to enumerate capture devices.'));
       return [];
@@ -172,10 +325,12 @@ export class CaptureAgent {
     this.onStatus(this.getStatus(clientCount));
   }
 
-  start({ deviceName, filter }, clientCount = 0) {
+  async start({ deviceName, filter }, clientCount = 0) {
     this.stop(clientCount, false);
 
-    const selectedDevice = deviceName || Cap.findDevice();
+    this.localAddresses = getLocalAddresses();
+
+    const selectedDevice = await resolveCaptureDevice(deviceName);
     if (!selectedDevice) {
       throw new Error('No compatible capture device found. Install Npcap/WinPcap compatibility on Windows or libpcap on Linux.');
     }

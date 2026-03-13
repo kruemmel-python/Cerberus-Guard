@@ -1,5 +1,4 @@
 import crypto from 'node:crypto';
-import os from 'node:os';
 
 export const PROVIDER_DEFINITIONS = [
   {
@@ -116,34 +115,6 @@ export const createDefaultProviderSettings = () =>
     ])
   );
 
-const createSampleRule = () => ({
-  id: crypto.randomUUID(),
-  name: 'Protect RDP from external clients',
-  enabled: true,
-  matchMode: 'all',
-  conditions: [
-    {
-      id: crypto.randomUUID(),
-      field: 'destinationPort',
-      operator: 'equals',
-      value: '3389',
-    },
-    {
-      id: crypto.randomUUID(),
-      field: 'sourceIp',
-      operator: 'not_in_cidr',
-      value: '192.168.0.0/16',
-    },
-  ],
-  outcome: {
-    actionType: 'BLOCK',
-    attackType: 'brute_force',
-    confidence: 0.9,
-    explanation: 'External RDP traffic is blocked by policy.',
-    needsDeepInspection: false,
-  },
-});
-
 const createThreatIntelSources = () => ([
   {
     id: crypto.randomUUID(),
@@ -162,11 +133,11 @@ const createThreatIntelSources = () => ([
 ]);
 
 export const createDefaultServerConfig = () => ({
-  llmProvider: 'gemini',
+  llmProvider: 'lmstudio',
   providerSettings: createDefaultProviderSettings(),
   deploymentMode: 'standalone',
-  sensorId: crypto.randomUUID(),
-  sensorName: os.hostname(),
+  sensorId: 'desktop-lab-01',
+  sensorName: 'Windows Lab Sensor',
   hubUrl: '',
   fleetSharedToken: '',
   globalBlockPropagationEnabled: false,
@@ -176,7 +147,7 @@ export const createDefaultServerConfig = () => ({
   batchWindowMs: 2000,
   batchMaxSize: 20,
   securePort: 9999,
-  monitoringPorts: [21, 22, 80, 443, 445, 1433, 3306, 3389],
+  monitoringPorts: [22, 80, 443, 8080, 3389],
   detectionThreshold: 0.75,
   autoBlockThreats: false,
   liveRawFeedEnabled: false,
@@ -185,11 +156,11 @@ export const createDefaultServerConfig = () => ({
   payloadMaskingMode: 'raw_local_only',
   threatIntelEnabled: false,
   threatIntelRefreshHours: 24,
-  threatIntelAutoBlock: true,
+  threatIntelAutoBlock: false,
   threatIntelSources: createThreatIntelSources(),
   blockedIps: [],
   blockedPorts: [],
   exemptPorts: [],
   webhookIntegrations: [],
-  customRules: [createSampleRule()],
+  customRules: [],
 });

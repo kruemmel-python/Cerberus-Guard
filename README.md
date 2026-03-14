@@ -1,7 +1,7 @@
 
 
 # Cerberus Guard AI
-
+![Cerberus Guard Info](cb_info.png)
 
 Cerberus Guard AI now runs as a backend-driven IDS/IPS stack with:
 

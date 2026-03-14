@@ -366,7 +366,7 @@ Fuer den produktiven Betrieb mit einem lokalen Modell:
 
 Fuer die komplette Server-Seite mit Token, Reverse Proxy, Netztrennung und API-Tests siehe auch `CAPE_SETUP.md`.
 
-Wenn du keinen externen Sandbox-Server betreiben willst, kannst du stattdessen in `Einstellungen -> Sandbox` den Provider `Cerberus Lab (lokale Reverse-Analyse)` auswaehlen. Dann fuehrt NetGuard die Datei lokal ueber seine eingebaute Reverse-Analysis-Pipeline aus: Quarantaene-Kopie, Hashing, Strings, PE-Imports, Entropie, decompiler-aehnlicher Pseudocode und optionaler LLM-Analystenbericht.
+Wenn du keinen externen Sandbox-Server betreiben willst, kannst du stattdessen in `Einstellungen -> Sandbox` den Provider `Cerberus Lab (lokale Reverse-Analyse)` auswaehlen. Dann fuehrt NetGuard die Datei lokal ueber seine eingebaute Reverse-Analysis-Pipeline aus: Quarantaene-Kopie, Hashing, Strings, PE-Imports, Entropie, decompiler-aehnlicher Pseudocode und optionaler LLM-Analystenbericht. Fuer `PDF`- und Bilddateien nutzt Cerberus Lab jetzt zusaetzlich formatbewusste Structural Analyzer.
 
 ### Cerberus Lab nutzen
 
@@ -390,6 +390,9 @@ Danach kannst du im Live-Verkehrs-Feed beim lokalen Prozess auf `In Sandbox anal
 - `SHA-256`, `SHA-1`, `MD5`
 - extrahierte Strings und IoCs
 - PE-Metadaten, Import-Tabelle und Entropie
+- Office-/OOXML-/RTF-/OLE-Strukturen, Makros, Embedded Objects und externe Beziehungen
+- PDF-Objekte, Streams, JavaScript, Embedded Files und Launch/Open-Actions
+- Bild-Metadaten, SVG-Active-Content, angehaengte Payloads und eingebettete Signaturen
 - decompiler-aehnliche Pseudocode-Zusammenfassung
 - PDF-Export direkt aus dem Dashboard
 
@@ -423,6 +426,50 @@ Wichtig:
 - Die Hash-Vorschau wird lokal im Browser berechnet, bevor die Datei an das Backend uebertragen wird.
 - Die eigentliche Analyse bleibt trotzdem serverseitig und wird wie alle anderen Sandbox-Ergebnisse persistent gespeichert.
 
+### Was Cerberus Lab bei PDF- und Bilddateien zusaetzlich erkennt
+
+Bei `PDF`-Dateien analysiert Cerberus Lab jetzt unter anderem:
+
+- Anzahl der Objekte und Streams
+- `OpenAction` und weitere automatische Aktionen
+- eingebettetes `JavaScript`
+- `Launch`-Aktionen
+- `Embedded Files` und Dateinamen
+- externe `URI`-Aktionen
+- verdaechtige High-Entropy-Streams
+
+Bei Bilddateien wie `PNG`, `JPEG`, `GIF`, `BMP`, `WebP`, `SVG`, `ICO` und `TIFF` analysiert Cerberus Lab unter anderem:
+
+- Format und Bildabmessungen
+- SVG-Skripte, Event-Handler und externe Referenzen
+- verdaechtige Text-/Kommentar-Metadaten
+- angehaengte Payloads hinter dem echten Dateiende
+- eingebettete Signaturen wie `MZ`, `PK` oder `%PDF`
+
+Diese Befunde erscheinen:
+
+- in der normalen Sandbox-Zusammenfassung
+- im gespeicherten Rohbefund
+- im exportierten Sandbox-PDF unter `PDF Structural Analysis` oder `Image Structural Analysis`
+
+### Was Cerberus Lab bei Office-Dokumenten zusaetzlich erkennt
+
+Bei Office-Dateien wie `DOCX`, `DOCM`, `XLSX`, `XLSM`, `PPTX`, `PPTM`, klassischen `DOC`/`XLS`/`PPT` und `RTF` erkennt Cerberus Lab jetzt unter anderem:
+
+- Makro-Projekte wie `vbaProject.bin`
+- Auto-Exec-Hinweise wie `AutoOpen`, `Document_Open`, `Workbook_Open`
+- Macro-Execution-Surfaces wie `CreateObject`, `WScript.Shell`, `PowerShell`
+- eingebettete OLE-/Package-Objekte
+- externe Relationships und Template-Referenzen
+- `ActiveX`- und `customUI`-Inhalte
+- `DDE`-Felder und aehnliche Dokument-Funktionen
+
+Diese Befunde erscheinen:
+
+- in der normalen Sandbox-Zusammenfassung
+- im gespeicherten Rohbefund
+- im exportierten Sandbox-PDF unter `Office Structural Analysis`
+
 ### Sidecars bei lokalen Prozessdateien
 
 Wenn du keine hochgeladene Datei, sondern einen lokal gefundenen Prozess aus dem Live-Feed in Cerberus Lab analysierst, versucht NetGuard jetzt automatisch benachbarte Sidecars mitzunehmen:
@@ -454,6 +501,19 @@ Zusatznutzen der Dynamic-Analyse:
 - Datei-Aenderungen in typischen Benutzerpfaden
 - Autorun-Registry-Aenderungen
 - neu angelegte Windows-Dienste
+
+Bei `PDF`- und Bilddateien oeffnet NetGuard das Sample im Gast jetzt ueber einen passenden Viewer. Dadurch koennen auch dokument- oder bildbasierte Angriffe in der Windows Sandbox echte Laufzeitspuren hinterlassen, statt nur statisch beurteilt zu werden.
+
+Zusaetzlich wertet Cerberus Lab diese Laufzeitspuren jetzt explizit aus und schreibt sie klar in den Bericht:
+
+- ob nur der Viewer gestartet wurde oder sekundaere ausfuehrbare Prozesse ausserhalb des Viewers aufgetaucht sind
+- ob echte Payload-Dateien im Gast gedroppt wurden, auch wenn sie nur als `.tmp` ohne aussagekraeftige Dateiendung angelegt wurden
+- ob reale Remote-TCP-Kommunikation stattgefunden hat, statt nur lokaler Listener oder leerer `0.0.0.0:0`-Eintraege
+- ob eingebettete `MZ`-Treffer in einer PDF nur Marker sind oder als echte eingebettete PE-Struktur validiert werden koennen
+- ob neue Gastprozesse wirklich zur Viewer-/Dokumentkette gehoeren oder nur als unzuordenbare Sandbox-Nebenwirkung beobachtet wurden
+- ob Remote-Ziele eher zu Microsoft, Google, CDNs, dokumentierten PDF-URIs oder zu nicht im Dokument referenzierten Hosts gehoeren
+
+Bei Office-Dokumenten versucht NetGuard im Gast ebenfalls eine echte Viewer-/Dokument-Oeffnung. Wenn auf dem Sandbox-Gast kein passender Handler installiert ist, wird das als echter Laufzeitfehler zurueckgegeben und nicht still simuliert.
 
 Diese Befunde landen ebenfalls im gespeicherten Sandbox-Eintrag und im PDF-Bericht.
 

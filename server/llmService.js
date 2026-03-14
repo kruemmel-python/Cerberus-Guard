@@ -242,6 +242,17 @@ const isCompleteAnalysisPayload = payload => (
 );
 
 const ensureApiKey = definition => {
+  if (definition.id === 'gemini') {
+    const candidates = uniqueStrings([
+      process.env.GOOGLE_API_KEY,
+      process.env.GEMINI_API_KEY,
+    ]);
+    if (candidates.length === 0) {
+      throw new Error('Gemini API key is not configured in GOOGLE_API_KEY or GEMINI_API_KEY.');
+    }
+    return candidates[0];
+  }
+
   if (!definition.requiresApiKey) {
     return '';
   }
@@ -251,6 +262,40 @@ const ensureApiKey = definition => {
     throw new Error(`${definition.label} API key is not configured in ${definition.envVar}.`);
   }
   return apiKey;
+};
+
+const getGeminiApiKeyCandidates = () => {
+  const candidates = uniqueStrings([
+    process.env.GOOGLE_API_KEY,
+    process.env.GEMINI_API_KEY,
+  ]);
+  if (candidates.length === 0) {
+    throw new Error('Gemini API key is not configured in GOOGLE_API_KEY or GEMINI_API_KEY.');
+  }
+  return candidates;
+};
+
+const withGeminiSdkApiKey = async (apiKey, callback) => {
+  const previousGoogleApiKey = process.env.GOOGLE_API_KEY;
+  const previousGeminiApiKey = process.env.GEMINI_API_KEY;
+  process.env.GOOGLE_API_KEY = apiKey;
+  process.env.GEMINI_API_KEY = apiKey;
+
+  try {
+    return await callback();
+  } finally {
+    if (previousGoogleApiKey === undefined) {
+      delete process.env.GOOGLE_API_KEY;
+    } else {
+      process.env.GOOGLE_API_KEY = previousGoogleApiKey;
+    }
+
+    if (previousGeminiApiKey === undefined) {
+      delete process.env.GEMINI_API_KEY;
+    } else {
+      process.env.GEMINI_API_KEY = previousGeminiApiKey;
+    }
+  }
 };
 
 const normalizeBaseUrl = (baseUrl, transport) => {
@@ -492,16 +537,38 @@ const resolveLmStudioModel = async (model) => {
 };
 
 const requestGemini = async (model, systemPrompt, prompt, schema, definition, timeoutMs, options = {}) => {
-  const client = new GoogleGenAI({ apiKey: ensureApiKey(definition) });
-  const response = await client.models.generateContent({
-    model,
-    contents: `${systemPrompt}\n\n${prompt}`,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: schema,
-      temperature: 0.1,
-    },
-  });
+  const apiKeyCandidates = getGeminiApiKeyCandidates();
+  let response;
+  let lastError = null;
+
+  for (const apiKey of apiKeyCandidates) {
+    try {
+      response = await withGeminiSdkApiKey(apiKey, async () => {
+        const client = new GoogleGenAI({ apiKey });
+        return client.models.generateContent({
+          model,
+          contents: `${systemPrompt}\n\n${prompt}`,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: schema,
+            temperature: 0.1,
+          },
+        });
+      });
+      break;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const isAuthError = /API_KEY_INVALID|API Key not found|valid API key/i.test(message);
+      if (!isAuthError || apiKey === apiKeyCandidates[apiKeyCandidates.length - 1]) {
+        throw error;
+      }
+    }
+  }
+
+  if (!response) {
+    throw lastError instanceof Error ? lastError : new Error('Gemini did not return a response.');
+  }
   const rawResponseText = response.text;
   try {
     const payload = parseJsonPayload(rawResponseText);

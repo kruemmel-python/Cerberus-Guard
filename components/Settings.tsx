@@ -20,6 +20,9 @@ interface SettingsProps {
   configSyncState: 'idle' | 'saving' | 'saved' | 'error';
   onRefreshThreatIntel: () => Promise<void>;
   threatIntelRefreshPending: boolean;
+  onApplySettingsNow: () => Promise<void>;
+  applySettingsPending: boolean;
+  backendAppliedProviderLabel: string;
 }
 
 const SectionCard: React.FC<{ title: string; description?: string; children: React.ReactNode }> = ({ title, description, children }) => (
@@ -97,6 +100,9 @@ export const Settings: React.FC<SettingsProps> = ({
   configSyncState,
   onRefreshThreatIntel,
   threatIntelRefreshPending,
+  onApplySettingsNow,
+  applySettingsPending,
+  backendAppliedProviderLabel,
 }) => {
   const [ipInput, setIpInput] = useState('');
   const [portInput, setPortInput] = useState('');
@@ -182,8 +188,20 @@ export const Settings: React.FC<SettingsProps> = ({
         <div>
           <h2 className="text-3xl font-bold text-white">{t('settingsTitle')}</h2>
           <p className="mt-2 max-w-3xl text-sm text-gray-400">{t('settingsDescription')}</p>
+          <p className="mt-2 text-sm text-blue-200">
+            {t('settingsAppliedProviderLabel')}: <span className="font-semibold text-white">{backendAppliedProviderLabel}</span>
+          </p>
         </div>
-        <SyncBadge state={configSyncState} label={syncStateLabel} />
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={() => void onApplySettingsNow()}
+            disabled={applySettingsPending}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-700"
+          >
+            {applySettingsPending ? t('settingsApplyNowPending') : t('settingsApplyNow')}
+          </button>
+          <SyncBadge state={configSyncState} label={syncStateLabel} />
+        </div>
       </div>
 
       <div className="grid gap-8 xl:grid-cols-2">

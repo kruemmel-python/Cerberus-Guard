@@ -135,9 +135,11 @@ const App: React.FC = () => {
   const [captureActionPending, setCaptureActionPending] = useState(false);
   const [replayActionPending, setReplayActionPending] = useState(false);
   const [configSyncState, setConfigSyncState] = useState<ConfigSyncState>('idle');
+  const [applySettingsPending, setApplySettingsPending] = useState(false);
   const [sensors, setSensors] = useState<SensorSummary[]>([]);
   const [selectedSensorId, setSelectedSensorId] = useState<string | null>(null);
   const [threatIntelRefreshPending, setThreatIntelRefreshPending] = useState(false);
+  const [backendAppliedProviderLabel, setBackendAppliedProviderLabel] = useState('LM Studio / local-model');
   const { t } = useLocalization();
 
   const websocketRef = useRef<WebSocket | null>(null);
@@ -152,6 +154,7 @@ const App: React.FC = () => {
   const lastServerConfigRef = useRef(serializeServerConfig(config));
   const selectedSensorIdRef = useRef<string | null>(null);
   const lastSeenServerInstanceIdRef = useRef<string | null>(getLastSeenServerInstanceId());
+  const previousLlmProviderRef = useRef(config.llmProvider);
 
   useEffect(() => {
     configRef.current = config;
@@ -160,6 +163,10 @@ const App: React.FC = () => {
   useEffect(() => {
     selectedSensorIdRef.current = selectedSensorId;
   }, [selectedSensorId]);
+
+  useEffect(() => {
+    previousLlmProviderRef.current = config.llmProvider;
+  }, []);
 
   const appendClientLog = useCallback((message: string, level: LogLevel, details?: Record<string, unknown>) => {
     const entry: LogEntry = {
@@ -269,6 +276,8 @@ const App: React.FC = () => {
       const nextSelectedSensorId = payload.sensors.some(sensor => sensor.id === requestedSensorId)
         ? requestedSensorId
         : null;
+      const payloadProvider = getProviderDefinition(payload.config.llmProvider);
+      const payloadProviderSettings = getSelectedProviderSettings(payload.config);
 
       lastSeenServerInstanceIdRef.current = payload.serverInstanceId;
       markSeenServerInstance({ backendBaseUrl: normalizedBaseUrl }, payload.serverInstanceId);
@@ -290,6 +299,7 @@ const App: React.FC = () => {
           setMonitoringStatus(createInitialMonitoringStatus());
         }
         setConfig(payload.config);
+        setBackendAppliedProviderLabel(`${payloadProvider.label} / ${payloadProviderSettings.model || payloadProvider.defaultModel}`);
         setAvailableInterfaces(payload.interfaces);
         setLogs(payload.logs.slice(0, MAX_LOG_ENTRIES));
         setLiveTrafficFeed(payload.traffic.slice(0, MAX_FEED_ENTRIES));
@@ -532,14 +542,49 @@ const App: React.FC = () => {
     setConfigSyncState('saving');
 
     const nextConfig = await updateConfig(pendingConfig);
+    const appliedProvider = getProviderDefinition(nextConfig.llmProvider);
+    const appliedProviderSettings = getSelectedProviderSettings(nextConfig);
     backendContextReadyRef.current = true;
     lastServerConfigRef.current = serializeServerConfig(nextConfig);
     startTransition(() => {
       setConfig(nextConfig);
+      setBackendAppliedProviderLabel(`${appliedProvider.label} / ${appliedProviderSettings.model || appliedProvider.defaultModel}`);
     });
     markConfigSyncSaved();
     return nextConfig;
   }, [clearConfigSyncTimers, markConfigSyncSaved]);
+
+  const applySettingsNow = useCallback(async () => {
+    setApplySettingsPending(true);
+
+    try {
+      const expectedProvider = configRef.current.llmProvider;
+      const syncedConfig = await syncConfigNow();
+      if (syncedConfig.llmProvider !== expectedProvider) {
+        throw new Error(`Backend kept provider "${syncedConfig.llmProvider}" instead of "${expectedProvider}".`);
+      }
+
+      await hydrateFromBackend(syncedConfig.backendBaseUrl, {
+        preserveRawFeed: true,
+        sensorId: selectedSensorIdRef.current,
+      });
+
+      window.location.reload();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setConfigSyncState('error');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        lastError: message,
+      }));
+      appendClientLog(t('logConfigSyncFailed'), LogLevel.ERROR, {
+        error: message,
+        scope: 'applySettingsNow',
+      });
+    } finally {
+      setApplySettingsPending(false);
+    }
+  }, [appendClientLog, hydrateFromBackend, syncConfigNow, t]);
 
   const startMonitoring = useCallback(async () => {
     setCaptureActionPending(true);
@@ -777,6 +822,41 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!backendContextReadyRef.current) {
+      previousLlmProviderRef.current = config.llmProvider;
+      return;
+    }
+
+    if (previousLlmProviderRef.current === config.llmProvider) {
+      return;
+    }
+
+    previousLlmProviderRef.current = config.llmProvider;
+    clearConfigSyncTimers();
+    setConfigSyncState('saving');
+
+    void updateConfig(configRef.current).then(nextConfig => {
+      backendContextReadyRef.current = true;
+      lastServerConfigRef.current = serializeServerConfig(nextConfig);
+      startTransition(() => {
+        setConfig(nextConfig);
+      });
+      markConfigSyncSaved();
+    }).catch(error => {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      setConfigSyncState('error');
+      setMonitoringStatus(previousStatus => ({
+        ...previousStatus,
+        lastError: message,
+      }));
+      appendClientLog(t('logConfigSyncFailed'), LogLevel.ERROR, {
+        error: message,
+        scope: 'llmProviderImmediateSync',
+      });
+    });
+  }, [appendClientLog, clearConfigSyncTimers, config.llmProvider, markConfigSyncSaved, t]);
+
+  useEffect(() => {
+    if (!backendContextReadyRef.current) {
       return;
     }
     void hydrateFromBackend(configRef.current.backendBaseUrl, { preserveRawFeed: true, sensorId: selectedSensorId });
@@ -909,6 +989,9 @@ const App: React.FC = () => {
             configSyncState={configSyncState}
             onRefreshThreatIntel={triggerThreatIntelRefresh}
             threatIntelRefreshPending={threatIntelRefreshPending}
+            onApplySettingsNow={applySettingsNow}
+            applySettingsPending={applySettingsPending}
+            backendAppliedProviderLabel={backendAppliedProviderLabel}
           />
         );
       case 'Logs':
@@ -928,6 +1011,7 @@ const App: React.FC = () => {
             backendBaseUrl={config.backendBaseUrl}
             selectedSensorId={selectedSensorId}
             sensors={sensors}
+            onBeforeRun={syncConfigNow}
           />
         );
       default:

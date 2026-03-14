@@ -1,7 +1,4 @@
-
-
 # Cerberus Guard AI
-![Cerberus Guard Info](cb_info.png)
 
 Cerberus Guard AI now runs as a backend-driven IDS/IPS stack with:
 
@@ -27,6 +24,8 @@ Documentation:
 - Built-in local reverse-analysis sandbox: `Cerberus Lab` in `Settings -> Sandbox`
 - Optional dynamic detonation via Windows Sandbox: enable `Windows Sandbox detonation` under `Cerberus Lab`
 - Direct browser upload for downloaded files in `Dashboard -> Sandbox Analyses`, including local SHA-256 preview before submission
+- Built-in structural analyzers for `PDF` and image formats, including malicious active-content indicators in exported sandbox PDF reports
+- Built-in Office document analysis for `DOCX/XLSX/PPTX`, macro-enabled OOXML, legacy `DOC/XLS/PPT` and `RTF`
 
 ## Requirements
 
@@ -111,6 +110,10 @@ The `Threat Hunt` tab sends a natural-language question to the backend. The back
 ## Sandbox integration
 
 Cerberus Guard can submit suspicious local process files either to an external CAPE sandbox or to the built-in `Cerberus Lab` reverse-analysis pipeline from the backend. `Cerberus Lab` now supports an optional Windows-Sandbox-based dynamic execution stage in addition to static reverse analysis. You can also upload a downloaded file bundle directly from the browser in `Dashboard -> Sandbox Analyses`; the UI calculates a local SHA-256 preview for the primary sample before the backend performs the persisted analysis, and extra uploaded files are staged as sidecars for dynamic execution. For local process-path analyses, Cerberus Lab also auto-discovers adjacent DLL and manifest sidecars where possible. Stored sandbox results can also be exported as PDF reports directly from the UI. For the full CAPE server-side setup, reverse proxy guidance and token handling, see `CAPE_SETUP.md`.
+
+Cerberus Lab now includes file-type-aware structural analyzers for `PDF` and common image formats. PDF samples are inspected for object graphs, streams, embedded JavaScript, embedded files, external URI actions, launch actions and auto-open behavior. Embedded `MZ` markers in PDFs are now validated against real PE structure before they are reported as embedded executables. Image samples are inspected for SVG active content, suspicious metadata, trailing appended payloads and embedded executable/archive signatures. When `Windows Sandbox detonation` is enabled, Cerberus Lab also opens `PDF` and supported image files in a guest viewer so dynamic analysis can capture spawned processes, network activity and filesystem changes for document/image-borne threats as well. The dynamic stage now distinguishes between plain viewer launch, attributed secondary execution in the viewer process tree, confirmed dropped payload files and classified remote TCP communication from viewer context vs. non-viewer child processes.
+
+Cerberus Lab also analyzes Office-style documents. OOXML packages such as `DOCX/XLSX/PPTX` and macro-enabled `DOCM/XLSM/PPTM` are inspected for macro projects, auto-exec triggers, embedded objects, external relationships, ActiveX and custom UI content. Legacy OLE documents (`DOC/XLS/PPT`) and `RTF` samples are scanned for macro-like strings, embedded OLE objects, DDE fields and suspicious external references. These findings are included in the stored sandbox result, LLM review projection and exported sandbox PDF report.
 
 When using a local LLM runtime such as LM Studio or Ollama, `Settings -> Sandbox -> Prioritize sandbox over traffic LLM` defers new traffic deep-inspection requests while Cerberus Lab is actively reviewing a file, so sandbox analyst summaries do not get starved behind normal traffic prompts.
 

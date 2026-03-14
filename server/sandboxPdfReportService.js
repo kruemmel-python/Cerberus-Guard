@@ -59,6 +59,22 @@ const formatBytes = bytes => {
 };
 
 const sanitizeFileName = value => value.replace(/[^a-zA-Z0-9._-]+/g, '_');
+const BENIGN_AUTORUN_PATTERN = /(microsoftedgeautolaunch|msedge\.exe.*--no-startup-window.*--win-session-start)/i;
+const isMeaningfulRemoteTcp = connection => {
+  const remoteAddress = String(connection?.remoteAddress || '').trim().toLowerCase();
+  const remotePort = Number(connection?.remotePort) || 0;
+  const state = String(connection?.state || '').trim().toLowerCase();
+
+  if (!remoteAddress || remotePort <= 0 || state === 'listen') {
+    return false;
+  }
+
+  if (remoteAddress === '0.0.0.0' || remoteAddress === '::' || remoteAddress === '::1' || remoteAddress === '127.0.0.1') {
+    return false;
+  }
+
+  return !remoteAddress.startsWith('127.') && !remoteAddress.startsWith('::ffff:127.');
+};
 
 const startSection = (document, title) => {
   document.moveDown(1.25);
@@ -113,7 +129,61 @@ const writeBulletList = (document, items) => {
   });
 };
 
+const formatProcessEvidence = processEntry => {
+  if (!processEntry || typeof processEntry !== 'object') {
+    return 'n/a';
+  }
+
+  const parts = [];
+  parts.push(processEntry.name || processEntry.commandLine || processEntry.processId || 'unknown');
+  if (processEntry.parentName) {
+    parts.push(`parent=${processEntry.parentName}`);
+  }
+  if (processEntry.creationTimeUtc) {
+    parts.push(`started=${formatTimestamp(processEntry.creationTimeUtc)}`);
+  }
+  if (processEntry.commandLine) {
+    parts.push(`cmd=${processEntry.commandLine}`);
+  }
+  return parts.join(' | ');
+};
+
+const formatClassifiedConnection = connection => {
+  if (!connection || typeof connection !== 'object') {
+    return 'n/a';
+  }
+
+  const parts = [`${connection.remoteAddress || connection.remote_address}:${connection.remotePort || connection.remote_port}`];
+  const provider = connection.providerCategory || connection.provider_category;
+  const relation = connection.documentRelation || connection.document_relation;
+  const matchedHosts = connection.matchedDocumentHosts || connection.matched_document_hosts || [];
+  if (provider) {
+    parts.push(`provider=${provider}`);
+  }
+  if (relation) {
+    parts.push(`relation=${relation}`);
+  }
+  if (Array.isArray(matchedHosts) && matchedHosts.length > 0) {
+    parts.push(`matched=${matchedHosts.join(', ')}`);
+  }
+  return parts.join(' | ');
+};
+
 const buildRecommendations = analysis => {
+  const dynamicFindings = analysis?.raw?.dynamicAssessment?.findings;
+  if (
+    dynamicFindings?.secondaryCodeExecutionConfirmed
+    || dynamicFindings?.payloadDropConfirmed
+    || dynamicFindings?.payloadExecutionConfirmed
+    || dynamicFindings?.secondaryNetworkCommunicationConfirmed
+  ) {
+    return [
+      'Isolate the affected host or account until the dropped files, child processes and outbound destinations are triaged.',
+      'Preserve the dropped payloads, Windows Sandbox artifacts, PCAP window and related logs for incident response.',
+      'Review the confirmed child processes, autoruns and remote endpoints for follow-on execution or lateral movement.',
+    ];
+  }
+
   switch (analysis.verdict) {
     case 'malicious':
       return [
@@ -227,7 +297,7 @@ const extractDecompilerSummary = raw => {
     lines.push(...decompilation.pseudoCode.slice(0, 10));
   }
 
-  return lines.slice(0, 14);
+  return lines.slice(0, 24);
 };
 
 const extractLlmReview = raw => {
@@ -259,6 +329,9 @@ const extractDynamicExecutionSummary = raw => {
     return [];
   }
 
+  const findings = raw?.dynamicAssessment?.findings && typeof raw.dynamicAssessment.findings === 'object'
+    ? raw.dynamicAssessment.findings
+    : null;
   const lines = [];
   lines.push(`Mode: ${execution.mode || execution.platform || 'n/a'}`);
   lines.push(`Status: ${execution.status || 'n/a'}`);
@@ -277,11 +350,50 @@ const extractDynamicExecutionSummary = raw => {
   if (execution.execution?.commandLine) {
     lines.push(`Launch command: ${execution.execution.commandLine}`);
   }
+  if (findings) {
+    lines.push(`Viewer launch observed: ${findings.viewerLaunchObserved ? `yes (${findings.viewerProcessName || execution.execution?.processName || 'unknown process'})` : 'no'}`);
+    lines.push(`Secondary executable code: ${findings.secondaryCodeExecutionConfirmed ? 'confirmed' : 'not confirmed'}`);
+    if (findings.secondaryCodeExecutionConfirmed) {
+      const secondaryProcesses = Array.isArray(findings.secondaryExecutionProcesses) ? findings.secondaryExecutionProcesses : [];
+      const suspiciousProcesses = Array.isArray(findings.suspiciousExecutionProcesses) ? findings.suspiciousExecutionProcesses : [];
+      const evidenceProcesses = [...secondaryProcesses, ...suspiciousProcesses]
+        .map(formatProcessEvidence)
+        .filter(Boolean);
+      if (evidenceProcesses.length > 0) {
+        lines.push(`Secondary processes: ${evidenceProcesses.slice(0, 6).join(', ')}`);
+      }
+    } else if (Array.isArray(findings.unattributedProcesses) && findings.unattributedProcesses.length > 0) {
+      lines.push(`Unattributed new processes: ${findings.unattributedProcesses.slice(0, 6).map(formatProcessEvidence).join(', ')}`);
+    }
+    lines.push(`Dropped payloads: ${findings.payloadDropConfirmed ? 'confirmed' : 'not confirmed'}`);
+    if (findings.payloadDropConfirmed && Array.isArray(findings.droppedPayloads) && findings.droppedPayloads.length > 0) {
+      lines.push(`Dropped payload evidence: ${findings.droppedPayloads.slice(0, 6).map(file => `${file.path} [${file.signatureType || file.extension || 'unknown'}]`).join(', ')}`);
+    }
+    if (findings.payloadExecutionConfirmed && Array.isArray(findings.executedDroppedPayloads) && findings.executedDroppedPayloads.length > 0) {
+      lines.push(`Executed dropped payloads: ${findings.executedDroppedPayloads.slice(0, 4).map(file => file.path).join(', ')}`);
+    }
+    const networkVerdict = findings.secondaryNetworkCommunicationConfirmed
+      ? 'confirmed from secondary processes'
+      : findings.viewerNetworkCommunicationObserved
+        ? 'observed from viewer context only'
+        : findings.networkCommunicationConfirmed
+          ? 'confirmed'
+          : 'not confirmed';
+    lines.push(`Remote network communication: ${networkVerdict}`);
+    if (findings.secondaryNetworkCommunicationConfirmed && Array.isArray(findings.secondaryRemoteTcpConnections) && findings.secondaryRemoteTcpConnections.length > 0) {
+      lines.push(`Secondary remote TCP evidence: ${findings.secondaryRemoteTcpConnections.slice(0, 6).map(formatClassifiedConnection).join(', ')}`);
+    } else if (findings.viewerNetworkCommunicationObserved && Array.isArray(findings.remoteTcpConnections) && findings.remoteTcpConnections.length > 0) {
+      lines.push(`Viewer remote TCP evidence: ${findings.remoteTcpConnections.slice(0, 6).map(formatClassifiedConnection).join(', ')}`);
+    }
+  }
   if (Array.isArray(execution.processes) && execution.processes.length > 0) {
     lines.push(`Processes: ${execution.processes.slice(0, 5).map(processEntry => processEntry.name || processEntry.commandLine || processEntry.processId).join(', ')}`);
   }
-  if (Array.isArray(execution.network?.tcp) && execution.network.tcp.length > 0) {
-    lines.push(`TCP: ${execution.network.tcp.slice(0, 4).map(connection => `${connection.remoteAddress}:${connection.remotePort}`).join(', ')}`);
+  const meaningfulTcpConnections = Array.isArray(execution.network?.tcp)
+    ? execution.network.tcp.filter(isMeaningfulRemoteTcp)
+    : [];
+  if (meaningfulTcpConnections.length > 0) {
+    lines.push(`TCP: ${meaningfulTcpConnections.slice(0, 4).map(connection => `${connection.remoteAddress}:${connection.remotePort}`).join(', ')}`);
   }
   if (Array.isArray(execution.network?.udp) && execution.network.udp.length > 0) {
     lines.push(`UDP endpoints: ${execution.network.udp.slice(0, 4).map(connection => `${connection.localAddress}:${connection.localPort}`).join(', ')}`);
@@ -289,14 +401,17 @@ const extractDynamicExecutionSummary = raw => {
   if (Array.isArray(execution.files?.added) && execution.files.added.length > 0) {
     lines.push(`Added files: ${execution.files.added.slice(0, 4).map(file => file.path).join(', ')}`);
   }
-  if (Array.isArray(execution.registry?.runKeys) && execution.registry.runKeys.length > 0) {
-    lines.push(`Autoruns: ${execution.registry.runKeys.slice(0, 4).map(entry => `${entry.name}=${entry.value}`).join(', ')}`);
+  const suspiciousRunKeys = Array.isArray(execution.registry?.runKeys)
+    ? execution.registry.runKeys.filter(entry => !BENIGN_AUTORUN_PATTERN.test(`${entry?.name || ''} ${entry?.value || ''}`))
+    : [];
+  if (suspiciousRunKeys.length > 0) {
+    lines.push(`Autoruns: ${suspiciousRunKeys.slice(0, 4).map(entry => `${entry.name}=${entry.value}`).join(', ')}`);
   }
   if (Array.isArray(execution.services?.created) && execution.services.created.length > 0) {
     lines.push(`Created services: ${execution.services.created.slice(0, 4).map(service => service.name).join(', ')}`);
   }
 
-  return lines.slice(0, 14);
+  return lines.slice(0, 18);
 };
 
 const extractPromptInjectionSummary = raw => {
@@ -314,6 +429,151 @@ const extractPromptInjectionSummary = raw => {
   }
 
   return lines.slice(0, 12);
+};
+
+const extractOfficeStructuralSummary = raw => {
+  const office = raw?.staticAnalysis?.office;
+  if (!office || typeof office !== 'object') {
+    return [];
+  }
+
+  const lines = [];
+  if (office.description || office.format) {
+    lines.push(`Type: ${office.description || office.format}`);
+  }
+  if (office.subtype) {
+    lines.push(`Subtype: ${office.subtype}`);
+  }
+  if (Number.isFinite(office.entryCount)) {
+    lines.push(`Package entries: ${office.entryCount}`);
+  }
+  if (office.macroProject?.present) {
+    lines.push(`Macro project: ${(office.macroProject.entries || []).join(', ') || 'present'}`);
+  }
+  if ((office.macroProject?.autoExecIndicators || []).length > 0) {
+    lines.push(`Autoexec indicators: ${office.macroProject.autoExecIndicators.slice(0, 6).join(', ')}`);
+  }
+  if ((office.macroProject?.executionIndicators || []).length > 0) {
+    lines.push(`Macro execution indicators: ${office.macroProject.executionIndicators.slice(0, 6).join(', ')}`);
+  }
+  if (office.embeddedObjects?.present) {
+    lines.push(`Embedded objects: ${office.embeddedObjects.entries?.slice(0, 6).join(', ') || office.embeddedObjects.count}`);
+  }
+  if (office.activeX?.present) {
+    lines.push(`ActiveX entries: ${office.activeX.entries?.slice(0, 6).join(', ') || 'present'}`);
+  }
+  if (office.externalRelationships?.present) {
+    lines.push(`External relationships: ${office.externalRelationships.targets?.slice(0, 6).join(', ') || office.externalRelationships.count}`);
+  }
+  if (office.dde?.present) {
+    lines.push(`DDE fields: ${office.dde.indicators?.slice(0, 6).join(', ')}`);
+  }
+  if ((office.customUiEntries || []).length > 0) {
+    lines.push(`Custom UI entries: ${office.customUiEntries.slice(0, 6).join(', ')}`);
+  }
+  if ((office.urls || []).length > 0) {
+    lines.push(`Document URLs: ${office.urls.slice(0, 6).join(', ')}`);
+  }
+
+  return lines.slice(0, 14);
+};
+
+const extractPdfStructuralSummary = raw => {
+  const pdf = raw?.staticAnalysis?.pdf;
+  if (!pdf || typeof pdf !== 'object') {
+    return [];
+  }
+
+  const lines = [];
+  if (pdf.version) {
+    lines.push(`Version: PDF ${pdf.version}`);
+  }
+  if (Number.isFinite(pdf.objectCount)) {
+    lines.push(`Objects: ${pdf.objectCount}`);
+  }
+  if (Number.isFinite(pdf.pageCount)) {
+    lines.push(`Pages: ${pdf.pageCount}`);
+  }
+  if (Number.isFinite(pdf.streamCount)) {
+    lines.push(`Streams: ${pdf.streamCount}`);
+  }
+  if ((pdf.objectStreamCount || 0) > 0) {
+    lines.push(`Object streams: ${pdf.objectStreamCount}`);
+  }
+  if ((pdf.xrefStreamCount || 0) > 0) {
+    lines.push(`XRef streams: ${pdf.xrefStreamCount}`);
+  }
+  if (pdf.javascript?.present) {
+    lines.push(`JavaScript indicators: ${pdf.javascript.indicators?.join(', ') || 'present'}`);
+  }
+  if (pdf.autoActions?.present) {
+    lines.push(`Automatic actions: ${pdf.autoActions.indicators?.join(', ') || 'present'}`);
+  }
+  if (pdf.launchActions?.present) {
+    lines.push(`Launch actions: ${pdf.launchActions.indicators?.join(', ') || 'present'}`);
+  }
+  if (pdf.embeddedFiles?.present) {
+    lines.push(`Embedded files: ${pdf.embeddedFiles.names?.join(', ') || pdf.embeddedFiles.count}`);
+  }
+  if (pdf.uriActions?.present) {
+    lines.push(`External URIs: ${pdf.uriActions.urls?.join(', ') || pdf.uriActions.count}`);
+  }
+  if ((pdf.streamEntropy?.highEntropyStreamCount || 0) > 0) {
+    lines.push(`High-entropy streams: ${pdf.streamEntropy.suspiciousStreams?.join(', ') || pdf.streamEntropy.highEntropyStreamCount}`);
+  }
+  if (pdf.embeddedPayloads?.present) {
+    if (pdf.validatedPortableExecutables?.present) {
+      lines.push(`Validated embedded PE: ${pdf.validatedPortableExecutables.hits?.map(hit => `${hit.type}@${hit.offset}${hit.validation?.machine ? ` (${hit.validation.machine}${hit.validation?.subsystem ? ` / ${hit.validation.subsystem}` : ''})` : ''}`).join(', ') || pdf.validatedPortableExecutables.count}`);
+    }
+    const executableHits = (pdf.embeddedPayloads.hits || []).filter(hit => hit?.type === 'portable-executable');
+    if (executableHits.length > 0) {
+      lines.push(`Embedded executable code: ${executableHits.slice(0, 8).map(hit => `${hit.type}@${hit.offset}`).join(', ')}`);
+    }
+    lines.push(`Embedded payload signatures: ${pdf.embeddedPayloads.hits?.map(hit => `${hit.type}@${hit.offset}`).join(', ') || pdf.embeddedPayloads.count}`);
+  }
+
+  return lines.slice(0, 14);
+};
+
+const extractImageStructuralSummary = raw => {
+  const image = raw?.staticAnalysis?.image;
+  if (!image || typeof image !== 'object') {
+    return [];
+  }
+
+  const lines = [];
+  if (image.description || image.format) {
+    lines.push(`Format: ${image.description || image.format}`);
+  }
+  if (Number.isFinite(image.width) && Number.isFinite(image.height)) {
+    lines.push(`Dimensions: ${image.width} x ${image.height}`);
+  }
+  if (typeof image.animated === 'boolean') {
+    lines.push(`Animated: ${image.animated ? 'yes' : 'no'}`);
+  }
+  if ((image.metadata?.textEntryCount || 0) > 0) {
+    lines.push(`Metadata text entries: ${image.metadata.textEntryCount}`);
+  }
+  if ((image.metadata?.customChunks || []).length > 0) {
+    lines.push(`Custom chunks/segments: ${image.metadata.customChunks.slice(0, 6).join(', ')}`);
+  }
+  if ((image.metadata?.suspiciousIndicators || []).length > 0) {
+    lines.push(`Suspicious metadata: ${image.metadata.suspiciousIndicators.join(', ')}`);
+  }
+  if (image.activeContent?.present) {
+    lines.push(`Active content: ${(image.activeContent.indicators || []).slice(0, 6).join(', ') || 'present'}`);
+  }
+  if ((image.activeContent?.externalReferences || []).length > 0) {
+    lines.push(`External references: ${image.activeContent.externalReferences.slice(0, 6).join(', ')}`);
+  }
+  if (image.appendedPayload?.present) {
+    lines.push(`Appended payload: ${image.appendedPayload.bytes} bytes`);
+  }
+  if ((image.appendedPayload?.hits || []).length > 0) {
+    lines.push(`Embedded payload signatures: ${image.appendedPayload.hits.slice(0, 6).map(hit => `${hit.type}@${hit.offset}`).join(', ')}`);
+  }
+
+  return lines.slice(0, 14);
 };
 
 export const buildSandboxReportFileName = analysis =>
@@ -418,6 +678,24 @@ export const renderSandboxPdfReport = analysis => new Promise((resolve, reject) 
   if (promptInjectionSummary.length > 0) {
     startSection(document, 'Prompt Injection Indicators');
     writeBulletList(document, promptInjectionSummary);
+  }
+
+  const officeStructuralSummary = extractOfficeStructuralSummary(raw);
+  if (officeStructuralSummary.length > 0) {
+    startSection(document, 'Office Structural Analysis');
+    writeBulletList(document, officeStructuralSummary);
+  }
+
+  const pdfStructuralSummary = extractPdfStructuralSummary(raw);
+  if (pdfStructuralSummary.length > 0) {
+    startSection(document, 'PDF Structural Analysis');
+    writeBulletList(document, pdfStructuralSummary);
+  }
+
+  const imageStructuralSummary = extractImageStructuralSummary(raw);
+  if (imageStructuralSummary.length > 0) {
+    startSection(document, 'Image Structural Analysis');
+    writeBulletList(document, imageStructuralSummary);
   }
 
   startSection(document, 'Recommended SOC Actions');

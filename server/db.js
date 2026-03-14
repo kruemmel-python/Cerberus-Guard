@@ -772,19 +772,23 @@ export const listThreatIntelIndicators = () =>
   }));
 
 export const insertForensicsQuery = (queryRecord) => {
+  const createdAt = queryRecord.createdAt ?? queryRecord.generatedAt ?? new Date().toISOString();
   db.prepare(`
     INSERT OR REPLACE INTO forensics_queries (id, created_at, question, sql_query, summary, row_count, sensor_id)
     VALUES (@id, @createdAt, @question, @sqlQuery, @summary, @rowCount, @sensorId)
   `).run({
     id: queryRecord.id,
-    createdAt: queryRecord.createdAt,
+    createdAt,
     question: queryRecord.question,
     sqlQuery: queryRecord.sql,
     summary: queryRecord.summary,
-    rowCount: queryRecord.rows.length,
+    rowCount: Array.isArray(queryRecord.rows) ? queryRecord.rows.length : queryRecord.rowCount ?? 0,
     sensorId: queryRecord.sensorId ?? null,
   });
-  return queryRecord;
+  return {
+    ...queryRecord,
+    createdAt,
+  };
 };
 
 export const listRecentForensicsQueries = (limit = 20) =>
@@ -830,6 +834,32 @@ export const getForensicsSchema = () => ({
     {
       name: 'pcap_artifacts',
       columns: ['id', 'created_at', 'file_name', 'attack_type', 'source_ip', 'packet_count', 'bytes', 'sensor_id', 'sensor_name'],
+    },
+    {
+      name: 'sandbox_analyses',
+      columns: [
+        'id',
+        'created_at',
+        'updated_at',
+        'status',
+        'stage',
+        'stage_message',
+        'provider',
+        'verdict',
+        'summary',
+        'score',
+        'file_path',
+        'file_name',
+        'file_size',
+        'sha256',
+        'process_name',
+        'traffic_event_id',
+        'external_task_id',
+        'report_url',
+        'error_message',
+        'sensor_id',
+        'sensor_name',
+      ],
     },
     {
       name: 'sensors',

@@ -6,27 +6,20 @@ const BINARY_METADATA_TTL_MS = 10 * 60 * 1000;
 const PROCESS_QUERY_TIMEOUT_MS = 8_000;
 const ERROR_THROTTLE_MS = 60_000;
 
+const NETSTAT_TCP_ARGS = ['/d', '/s', '/c', 'netstat -ano -p tcp'];
+const NETSTAT_UDP_ARGS = ['/d', '/s', '/c', 'netstat -ano -p udp'];
+
 const WINDOWS_PROCESS_QUERY = `
-$tcp = @(Get-NetTCPConnection -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess)
-$udp = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess)
-$processIds = @($tcp.OwningProcess + $udp.OwningProcess | Where-Object { $_ -ne $null } | Sort-Object -Unique)
-$processFilter = ($processIds | ForEach-Object { "ProcessId = $_" }) -join ' OR '
-$processes = if ($processFilter) {
-  @(Get-CimInstance Win32_Process -Filter $processFilter -ErrorAction SilentlyContinue | Select-Object ProcessId,Name,ExecutablePath,CommandLine)
-} else {
-  @()
-}
-$services = if ($processIds.Count -gt 0) {
-  @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -in $processIds } | Select-Object Name,DisplayName,State,ProcessId)
-} else {
-  @()
-}
-[pscustomobject]@{
-  tcp = $tcp
-  udp = $udp
-  processes = $processes
-  services = $services
-} | ConvertTo-Json -Depth 6 -Compress
+@(Get-Process -ErrorAction SilentlyContinue | Select-Object @{
+    Name = 'ProcessId'
+    Expression = { $_.Id }
+  }, @{
+    Name = 'Name'
+    Expression = { $_.ProcessName }
+  }, @{
+    Name = 'ExecutablePath'
+    Expression = { $_.Path }
+  }) | ConvertTo-Json -Depth 4 -Compress
 `.trim();
 
 const buildBinaryMetadataQuery = (executablePath) => `
@@ -77,6 +70,18 @@ const buildListenerKey = ({ protocol, localAddress, localPort }) =>
   `${protocol}|${normalizeAddress(localAddress)}|${localPort}`;
 
 const buildLocalPortKey = ({ protocol, localPort }) => `${protocol}|${localPort}`;
+const isMulticastOrBroadcastAddress = address => {
+  const normalizedAddress = normalizeAddress(address);
+  if (!normalizedAddress) {
+    return false;
+  }
+
+  return normalizedAddress === '255.255.255.255'
+    || normalizedAddress === '224.0.0.251'
+    || normalizedAddress.startsWith('224.')
+    || normalizedAddress.startsWith('239.')
+    || normalizedAddress.startsWith('ff02:');
+};
 
 const createEmptySnapshot = () => ({
   exactEndpoints: new Map(),
@@ -84,9 +89,9 @@ const createEmptySnapshot = () => ({
   localPortEndpoints: new Map(),
 });
 
-const executeProcessQuery = (command, script) =>
+const executeCommand = (command, args, timeoutMs = PROCESS_QUERY_TIMEOUT_MS) =>
   new Promise((resolve, reject) => {
-    const child = spawn(command, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+    const child = spawn(command, args, {
       shell: false,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -102,7 +107,7 @@ const executeProcessQuery = (command, script) =>
       settled = true;
       child.kill();
       reject(new Error('Local process query timed out.'));
-    }, PROCESS_QUERY_TIMEOUT_MS);
+    }, timeoutMs);
 
     child.stdout.on('data', chunk => {
       stdout += chunk.toString();
@@ -136,18 +141,124 @@ const executeProcessQuery = (command, script) =>
     });
   });
 
-const parseProcessQueryResponse = (payload) => {
+const executeProcessQuery = script =>
+  executeCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script]);
+
+const parseJsonPayload = (payload, context) => {
   if (!payload) {
-    return { tcp: [], udp: [], processes: [], services: [] };
+    return null;
   }
 
-  const parsed = JSON.parse(payload);
+  const trimmedPayload = String(payload).replace(/^\uFEFF/, '').trim();
+  if (!trimmedPayload) {
+    return null;
+  }
+
+  const parseCandidate = (candidate) => JSON.parse(candidate);
+
+  try {
+    return parseCandidate(trimmedPayload);
+  } catch (error) {
+    const objectStart = trimmedPayload.indexOf('{');
+    const arrayStart = trimmedPayload.indexOf('[');
+    const firstJsonIndex = [objectStart, arrayStart]
+      .filter(index => index >= 0)
+      .sort((left, right) => left - right)[0] ?? -1;
+
+    if (firstJsonIndex >= 0) {
+      const objectEnd = trimmedPayload.lastIndexOf('}');
+      const arrayEnd = trimmedPayload.lastIndexOf(']');
+      const lastJsonIndex = Math.max(objectEnd, arrayEnd);
+
+      if (lastJsonIndex > firstJsonIndex) {
+        try {
+          return parseCandidate(trimmedPayload.slice(firstJsonIndex, lastJsonIndex + 1));
+        } catch {
+          // Fall through to the structured error below.
+        }
+      }
+    }
+
+    const preview = trimmedPayload.slice(0, 120).replace(/\s+/g, ' ');
+    throw new Error(
+      `Failed to parse ${context}. ${error instanceof Error ? error.message : 'Unexpected JSON parse error.'} Preview: ${preview}`
+    );
+  }
+};
+
+const parseProcessQueryResponse = (payload) => {
+  const parsed = parseJsonPayload(payload, 'local process snapshot');
+  return Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+};
+
+const parseNetstatSocket = (value) => {
+  if (!value) {
+    return { address: null, port: null };
+  }
+
+  const trimmedValue = String(value).trim();
+  if (!trimmedValue || trimmedValue === '*:*') {
+    return { address: '*', port: null };
+  }
+
+  const lastColonIndex = trimmedValue.lastIndexOf(':');
+  if (lastColonIndex === -1) {
+    return { address: trimmedValue, port: null };
+  }
+
+  const rawAddress = trimmedValue.slice(0, lastColonIndex).replace(/^\[/, '').replace(/\]$/, '');
+  const rawPort = trimmedValue.slice(lastColonIndex + 1);
   return {
-    tcp: Array.isArray(parsed.tcp) ? parsed.tcp : parsed.tcp ? [parsed.tcp] : [],
-    udp: Array.isArray(parsed.udp) ? parsed.udp : parsed.udp ? [parsed.udp] : [],
-    processes: Array.isArray(parsed.processes) ? parsed.processes : parsed.processes ? [parsed.processes] : [],
-    services: Array.isArray(parsed.services) ? parsed.services : parsed.services ? [parsed.services] : [],
+    address: rawAddress || '*',
+    port: rawPort === '*' ? null : normalizeNumber(rawPort),
   };
+};
+
+const parseNetstatResponse = (payload, protocol) => {
+  if (!payload) {
+    return [];
+  }
+
+  return payload
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && line.toUpperCase().startsWith(protocol))
+    .map(line => line.split(/\s+/))
+    .flatMap(parts => {
+      if (protocol === 'TCP' && parts.length >= 5) {
+        const localSocket = parseNetstatSocket(parts[1]);
+        const remoteSocket = parseNetstatSocket(parts[2]);
+        const owningProcess = normalizeNumber(parts[4]);
+        if (!localSocket.port || remoteSocket.port === null || owningProcess === null) {
+          return [];
+        }
+
+        return [{
+          LocalAddress: localSocket.address,
+          LocalPort: localSocket.port,
+          RemoteAddress: remoteSocket.address,
+          RemotePort: remoteSocket.port,
+          State: parts[3],
+          OwningProcess: owningProcess,
+        }];
+      }
+
+      if (protocol === 'UDP' && parts.length >= 4) {
+        const localSocket = parseNetstatSocket(parts[1]);
+        const owningProcess = normalizeNumber(parts[3]);
+        if (!localSocket.port || owningProcess === null) {
+          return [];
+        }
+
+        return [{
+          LocalAddress: localSocket.address,
+          LocalPort: localSocket.port,
+          OwningProcess: owningProcess,
+        }];
+      }
+
+      return [];
+    });
 };
 
 const buildProcessEntry = (endpoint, process, services, resolution) => ({
@@ -174,7 +285,7 @@ const addIfMissing = (map, key, value) => {
   }
 };
 
-const buildSnapshot = ({ tcp, udp, processes, services }) => {
+const buildSnapshot = ({ tcp, udp, processes, services = [] }) => {
   const snapshot = createEmptySnapshot();
   const processMap = new Map(
     processes.map(process => [normalizeNumber(process.ProcessId ?? process.pid), process])
@@ -340,8 +451,21 @@ export class ProcessResolver {
       return this.snapshot;
     }
 
-    const payload = await executeProcessQuery('powershell.exe', WINDOWS_PROCESS_QUERY);
-    this.snapshot = buildSnapshot(parseProcessQueryResponse(payload));
+    const [tcpPayload, udpPayload] = await Promise.all([
+      executeCommand('cmd.exe', NETSTAT_TCP_ARGS),
+      executeCommand('cmd.exe', NETSTAT_UDP_ARGS),
+    ]);
+
+    const tcp = parseNetstatResponse(tcpPayload, 'TCP');
+    const udp = parseNetstatResponse(udpPayload, 'UDP');
+    const processes = parseProcessQueryResponse(await executeProcessQuery(WINDOWS_PROCESS_QUERY));
+
+    this.snapshot = buildSnapshot({
+      tcp,
+      udp,
+      processes,
+      services: [],
+    });
     this.lastRefreshAt = Date.now();
     return this.snapshot;
   }
@@ -386,8 +510,8 @@ export class ProcessResolver {
     }
 
     try {
-      const payload = await executeProcessQuery('powershell.exe', buildBinaryMetadataQuery(executablePath));
-      const parsed = payload ? JSON.parse(payload) : {};
+      const payload = await executeProcessQuery(buildBinaryMetadataQuery(executablePath));
+      const parsed = parseJsonPayload(payload, 'binary metadata response') ?? {};
       const metadata = {
         companyName: normalizeText(parsed.companyName),
         fileDescription: normalizeText(parsed.fileDescription),
@@ -410,6 +534,13 @@ export class ProcessResolver {
   }
 
   lookupPacket(packet, snapshot) {
+    const isAmbiguousUdpDiscoveryPacket = packet.protocol === 'UDP'
+      && (packet.sourcePort === 5353 || packet.destinationPort === 5353)
+      && (packet.direction === 'UNKNOWN' || isMulticastOrBroadcastAddress(packet.destinationIp));
+    if (isAmbiguousUdpDiscoveryPacket) {
+      return null;
+    }
+
     const candidates = deriveLocalEndpointCandidates(packet);
 
     for (const candidate of candidates) {

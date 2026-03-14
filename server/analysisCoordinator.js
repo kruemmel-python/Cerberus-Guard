@@ -15,6 +15,18 @@ export class AnalysisCoordinator {
     this.queues = new Map();
   }
 
+  isCacheableResult(result) {
+    const explanation = typeof result?.explanation === 'string' ? result.explanation.toLowerCase() : '';
+    return !(
+      explanation === 'analysis incomplete.'
+      || explanation.includes('incomplete analysis json')
+      || explanation.includes('incomplete decision json')
+      || explanation.includes('did not return a json object')
+      || explanation.includes('returned no decision')
+      || explanation.includes('provider response did not contain valid json')
+    );
+  }
+
   reset(reason = 'Analysis queue reset.') {
     for (const queue of this.queues.values()) {
       if (queue.timer) {
@@ -30,7 +42,7 @@ export class AnalysisCoordinator {
   }
 
   getCacheKey(packet) {
-    return `${packet.sourceIp}:${packet.destinationPort}:${packet.protocol}:${packet.l7Protocol}`;
+    return `${packet.sourceIp}:${packet.destinationIp}:${packet.destinationPort}:${packet.protocol}:${packet.l7Protocol}`;
   }
 
   getQueueKey(config) {
@@ -110,17 +122,19 @@ export class AnalysisCoordinator {
         if (!item) {
           return;
         }
-        this.cache.set(this.getCacheKey(item.packet), {
-          isSuspicious: result.isSuspicious,
-          attackType: result.attackType,
-          confidence: result.confidence,
-          explanation: result.explanation,
-          matchedSignals: result.matchedSignals,
-          recommendedActionType: result.recommendedActionType,
-          recommendedTargetPort: result.recommendedTargetPort,
-        }, {
-          ttl: item.config.cacheTtlSeconds * 1000,
-        });
+        if (this.isCacheableResult(result)) {
+          this.cache.set(this.getCacheKey(item.packet), {
+            isSuspicious: result.isSuspicious,
+            attackType: result.attackType,
+            confidence: result.confidence,
+            explanation: result.explanation,
+            matchedSignals: result.matchedSignals,
+            recommendedActionType: result.recommendedActionType,
+            recommendedTargetPort: result.recommendedTargetPort,
+          }, {
+            ttl: item.config.cacheTtlSeconds * 1000,
+          });
+        }
         item.resolve(result);
       });
     } catch (error) {

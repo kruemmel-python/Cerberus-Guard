@@ -67,6 +67,7 @@ export class ForensicsChatService {
     const planningPrompt = `Schema:\n${JSON.stringify(schema, null, 2)}\n\n${sensorInstruction}\n\nQuestion:\n${question}`;
     const plannedQuery = await requestProviderJson(config, planningPrompt, SQL_PLAN_SCHEMA, {
       systemPrompt: SQL_SYSTEM_PROMPT,
+      priority: 'high',
     });
 
     const sql = typeof plannedQuery?.sql === 'string' ? plannedQuery.sql.trim() : '';
@@ -80,6 +81,7 @@ export class ForensicsChatService {
     const summaryPrompt = `Question:\n${question}\n\nSQL:\n${limitedSql}\n\nRows:\n${JSON.stringify(rows, null, 2)}`;
     const summaryResponse = await requestProviderJson(config, summaryPrompt, SUMMARY_SCHEMA, {
       systemPrompt: SUMMARY_SYSTEM_PROMPT,
+      priority: 'high',
     });
 
     const result = {

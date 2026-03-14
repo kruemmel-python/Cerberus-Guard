@@ -8,9 +8,10 @@ import { z } from 'zod';
 import {
   directories,
   getPcapArtifactById,
+  getSandboxAnalysisById,
+  getServerInstanceId,
   listPcapArtifacts,
   listRecentLogs,
-  listRecentSandboxAnalyses,
   listRecentTrafficEvents,
   listSensors,
   listTrafficMetrics,
@@ -18,6 +19,7 @@ import {
 } from './db.js';
 import { MonitoringService } from './monitoringService.js';
 import { revealLocalPath } from './localPathService.js';
+import { buildSandboxReportFileName, renderSandboxPdfReport } from './sandboxPdfReportService.js';
 
 const PORT = Number(process.env.NETGUARD_SERVER_PORT || 8081);
 const app = express();
@@ -26,6 +28,12 @@ const wsClients = new Set();
 
 const upload = multer({
   dest: directories.replayDirectory,
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+  },
+});
+const sandboxUpload = multer({
+  dest: directories.sandboxUploadsDirectory,
   limits: {
     fileSize: 100 * 1024 * 1024,
   },
@@ -98,7 +106,10 @@ app.get('/api/health', (_, response) => {
 
 app.get('/api/bootstrap', (request, response) => {
   const sensorId = typeof request.query.sensorId === 'string' && request.query.sensorId.trim() ? request.query.sensorId.trim() : null;
-  response.json(monitoringService.getBootstrapPayload(getClientCount(), sensorId));
+  response.json({
+    ...monitoringService.getBootstrapPayload(getClientCount(), sensorId),
+    serverInstanceId: getServerInstanceId(),
+  });
 });
 
 app.get('/api/interfaces', (_, response) => {
@@ -227,8 +238,95 @@ app.get('/api/sandbox/analyses', (request, response) => {
   const limit = Number(request.query.limit || 25);
   const sensorId = typeof request.query.sensorId === 'string' && request.query.sensorId.trim() ? request.query.sensorId.trim() : null;
   response.json({
-    analyses: listRecentSandboxAnalyses(limit, sensorId),
+    analyses: monitoringService.listSandboxAnalyses(limit, sensorId),
   });
+});
+
+app.post('/api/sandbox/analyses/:analysisId/retry-review', async (request, response) => {
+  try {
+    const analysis = await monitoringService.retrySandboxAnalystReview(request.params.analysisId);
+    response.json({
+      ok: true,
+      analysis,
+    });
+  } catch (error) {
+    response.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Failed to retry analyst review.',
+    });
+  }
+});
+
+app.get('/api/sandbox/analyses/:analysisId/llm-debug', (request, response) => {
+  const analysis = getSandboxAnalysisById(request.params.analysisId, { includeRaw: true });
+  if (!analysis) {
+    response.status(404).json({
+      ok: false,
+      error: 'Sandbox analysis not found.',
+    });
+    return;
+  }
+
+  if (analysis.provider !== 'cerberus_lab') {
+    response.status(400).json({
+      ok: false,
+      error: 'LLM debug is only available for Cerberus Lab analyses.',
+    });
+    return;
+  }
+
+  response.json({
+    ok: true,
+    debug: {
+      analysisId: analysis.id,
+      fileName: analysis.fileName,
+      provider: analysis.provider,
+      updatedAt: analysis.updatedAt,
+      reportReady: analysis.reportReady,
+      reportPendingReason: analysis.reportPendingReason,
+      llmReview: analysis.raw?.llmReview ?? null,
+      llmReviewDebug: analysis.raw?.llmReviewDebug ?? null,
+    },
+  });
+});
+
+app.get('/api/sandbox/analyses/:analysisId/report.pdf', async (request, response) => {
+  try {
+    monitoringService.sandboxService.pruneStaleAnalyses();
+    let analysis = getSandboxAnalysisById(request.params.analysisId, { includeRaw: true });
+    if (!analysis) {
+      response.status(404).json({
+        ok: false,
+        error: 'Sandbox analysis not found.',
+      });
+      return;
+    }
+
+    analysis = await monitoringService.sandboxService.refreshExistingAnalysis(analysis);
+
+    if (!analysis.reportReady) {
+      response.status(409).json({
+        ok: false,
+        error: analysis.reportPendingReason || 'Sandbox PDF report is not available yet because the analyst review is still pending.',
+        status: analysis.status,
+        stage: analysis.stage,
+        reportReady: analysis.reportReady,
+        reportPendingReason: analysis.reportPendingReason,
+      });
+      return;
+    }
+
+    const pdfBuffer = await renderSandboxPdfReport(analysis);
+    response.setHeader('Content-Type', 'application/pdf');
+    response.setHeader('Content-Disposition', `attachment; filename="${buildSandboxReportFileName(analysis)}"`);
+    response.setHeader('Content-Length', String(pdfBuffer.length));
+    response.send(pdfBuffer);
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Failed to render sandbox PDF report.',
+    });
+  }
 });
 
 app.get('/api/pcap-artifacts/:artifactId/download', (request, response) => {
@@ -316,6 +414,64 @@ app.post('/api/sandbox/analyze-process', async (request, response) => {
       error: error instanceof Error ? error.message : 'Sandbox analysis failed.',
       analysis: failedAnalysis ?? null,
     });
+  }
+});
+
+app.post('/api/sandbox/analyze-upload', sandboxUpload.fields([
+  { name: 'sample', maxCount: 1 },
+  { name: 'attachments', maxCount: 32 },
+]), async (request, response) => {
+  const uploadedFiles = [
+    ...(((request.files || {}).sample) || []),
+    ...(((request.files || {}).attachments) || []),
+  ];
+
+  try {
+    const primaryUpload = ((request.files || {}).sample || [])[0];
+    const attachmentUploads = ((request.files || {}).attachments || []);
+
+    if (!primaryUpload) {
+      throw new Error('No sample file was uploaded.');
+    }
+
+    const analysis = await monitoringService.analyzeUploadedFile({
+      filePath: primaryUpload.path,
+      fileName: primaryUpload.originalname || path.basename(primaryUpload.path),
+      attachments: attachmentUploads.map(file => ({
+        sourcePath: file.path,
+        fileName: file.originalname || path.basename(file.path),
+        relativePath: file.originalname || path.basename(file.path),
+        size: file.size ?? null,
+      })),
+    });
+
+    response.json({
+      ok: true,
+      analysis,
+    });
+  } catch (error) {
+    const failedAnalysis = error?.analysis;
+    if (failedAnalysis) {
+      monitoringService.broadcast?.({
+        type: 'sandbox-analysis',
+        payload: failedAnalysis,
+      });
+    }
+    response.status(400).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Sandbox upload analysis failed.',
+      analysis: failedAnalysis ?? null,
+    });
+  } finally {
+    for (const uploadedFile of uploadedFiles) {
+      if (uploadedFile?.path && fs.existsSync(uploadedFile.path)) {
+        try {
+          fs.rmSync(uploadedFile.path, { force: true });
+        } catch (cleanupError) {
+          console.warn('[sandbox-upload-cleanup]', cleanupError);
+        }
+      }
+    }
   }
 });
 

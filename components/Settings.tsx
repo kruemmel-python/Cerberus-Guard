@@ -247,6 +247,16 @@ export const Settings: React.FC<SettingsProps> = ({
                 <p className="text-xs text-gray-500">{activeProviderDefinition.id === 'lmstudio' ? t('lmStudioUrlHint') : activeProviderDefinition.id === 'ollama' ? t('ollamaUrlHint') : t('providerBaseUrlHint')}</p>
               </>
             )}
+            <TextInput
+              label={t('localLlmTimeoutSeconds')}
+              type="number"
+              value={config.localLlmTimeoutSeconds}
+              onChange={event => setConfig(previousConfig => ({
+                ...previousConfig,
+                localLlmTimeoutSeconds: Number.parseInt(event.target.value, 10) || 300,
+              }))}
+            />
+            <p className="text-xs text-gray-500">{t('localLlmTimeoutHint')}</p>
             <SelectInput label={t('payloadMaskingMode')} value={config.payloadMaskingMode} onChange={event => setConfig(previousConfig => ({ ...previousConfig, payloadMaskingMode: event.target.value as Configuration['payloadMaskingMode'] }))}>
               <option value="raw_local_only">{t('payloadMaskingMode_raw_local_only')}</option>
               <option value="strict">{t('payloadMaskingMode_strict')}</option>
@@ -357,43 +367,76 @@ export const Settings: React.FC<SettingsProps> = ({
               checked={config.sandboxAutoSubmitSuspicious}
               onChange={checked => setConfig(previousConfig => ({ ...previousConfig, sandboxAutoSubmitSuspicious: checked }))}
             />
+            <ToggleField
+              label={t('sandboxPrioritizeLlmWorkloads')}
+              description={t('sandboxPrioritizeLlmWorkloadsHint')}
+              checked={config.sandboxPrioritizeLlmWorkloads}
+              onChange={checked => setConfig(previousConfig => ({ ...previousConfig, sandboxPrioritizeLlmWorkloads: checked }))}
+            />
             <SelectInput
               label={t('sandboxProvider')}
               value={config.sandboxProvider}
               onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxProvider: event.target.value as Configuration['sandboxProvider'] }))}
             >
-              <option value="cape">CAPE Sandbox</option>
+              <option value="cerberus_lab">{t('sandboxProvider_cerberus_lab')}</option>
+              <option value="cape">{t('sandboxProvider_cape')}</option>
               <option value="none">{t('sandboxProvider_none')}</option>
             </SelectInput>
-            <TextInput
-              label={t('sandboxBaseUrl')}
-              value={config.sandboxBaseUrl}
-              onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxBaseUrl: event.target.value }))}
-              placeholder="http://localhost:8090"
-            />
-            <TextInput
-              label={t('sandboxApiKey')}
-              type="password"
-              value={config.sandboxApiKey}
-              onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxApiKey: event.target.value }))}
-              placeholder={t('sandboxApiKeyPlaceholder')}
-            />
-            <p className="text-xs text-gray-500">{t('sandboxApiKeyHint')}</p>
-            <div className="grid gap-4 md:grid-cols-2">
-              <TextInput
-                label={t('sandboxPollingIntervalMs')}
-                type="number"
-                value={config.sandboxPollingIntervalMs}
-                onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxPollingIntervalMs: Number.parseInt(event.target.value, 10) || 1000 }))}
-              />
-              <TextInput
-                label={t('sandboxTimeoutSeconds')}
-                type="number"
-                value={config.sandboxTimeoutSeconds}
-                onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxTimeoutSeconds: Number.parseInt(event.target.value, 10) || 60 }))}
-              />
-            </div>
-            <p className="text-xs text-gray-500">{t('sandboxProviderHint')}</p>
+            {config.sandboxProvider === 'cape' ? (
+              <>
+                <TextInput
+                  label={t('sandboxBaseUrl')}
+                  value={config.sandboxBaseUrl}
+                  onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxBaseUrl: event.target.value }))}
+                  placeholder="http://localhost:8090"
+                />
+                <TextInput
+                  label={t('sandboxApiKey')}
+                  type="password"
+                  value={config.sandboxApiKey}
+                  onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxApiKey: event.target.value }))}
+                  placeholder={t('sandboxApiKeyPlaceholder')}
+                />
+                <p className="text-xs text-gray-500">{t('sandboxApiKeyHint')}</p>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <TextInput
+                    label={t('sandboxPollingIntervalMs')}
+                    type="number"
+                    value={config.sandboxPollingIntervalMs}
+                    onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxPollingIntervalMs: Number.parseInt(event.target.value, 10) || 1000 }))}
+                  />
+                  <TextInput
+                    label={t('sandboxTimeoutSeconds')}
+                    type="number"
+                    value={config.sandboxTimeoutSeconds}
+                    onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxTimeoutSeconds: Number.parseInt(event.target.value, 10) || 60 }))}
+                  />
+                </div>
+                <p className="text-xs text-gray-500">{t('sandboxProviderHint')}</p>
+              </>
+            ) : config.sandboxProvider === 'cerberus_lab' ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+                  <div className="font-semibold">{t('sandboxProvider_cerberus_lab')}</div>
+                  <div className="mt-2">{t('sandboxProviderHintCerberusLab')}</div>
+                </div>
+                <ToggleField
+                  label={t('sandboxDynamicExecutionEnabled')}
+                  description={t('sandboxDynamicExecutionEnabledHint')}
+                  checked={config.sandboxDynamicExecutionEnabled}
+                  onChange={checked => setConfig(previousConfig => ({ ...previousConfig, sandboxDynamicExecutionEnabled: checked }))}
+                />
+                <TextInput
+                  label={t('sandboxDynamicRuntimeSeconds')}
+                  type="number"
+                  value={config.sandboxDynamicRuntimeSeconds}
+                  onChange={event => setConfig(previousConfig => ({ ...previousConfig, sandboxDynamicRuntimeSeconds: Number.parseInt(event.target.value, 10) || 45 }))}
+                />
+                <p className="text-xs text-gray-500">{t('sandboxDynamicRuntimeHint')}</p>
+              </div>
+            ) : (
+              <p className="text-xs text-gray-500">{t('sandboxProvider_none')}</p>
+            )}
           </div>
         </SectionCard>
 

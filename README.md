@@ -21,6 +21,9 @@ Documentation:
 
 - LM Studio usage guide: `USE.md`
 - CAPE sandbox server setup: `CAPE_SETUP.md`
+- Built-in local reverse-analysis sandbox: `Cerberus Lab` in `Settings -> Sandbox`
+- Optional dynamic detonation via Windows Sandbox: enable `Windows Sandbox detonation` under `Cerberus Lab`
+- Direct browser upload for downloaded files in `Dashboard -> Sandbox Analyses`, including local SHA-256 preview before submission
 
 ## Requirements
 
@@ -70,6 +73,9 @@ Documentation:
 - `GET /api/traffic`
 - `GET /api/metrics`
 - `GET /api/pcap-artifacts`
+- `GET /api/sandbox/analyses`
+- `POST /api/sandbox/analyze-upload`
+- `GET /api/sandbox/analyses/:analysisId/report.pdf`
 - `GET /api/pcap-artifacts/:artifactId/download`
 - `GET /api/fleet/sensors`
 - `GET /api/threat-intel/status`
@@ -101,7 +107,9 @@ The `Threat Hunt` tab sends a natural-language question to the backend. The back
 
 ## Sandbox integration
 
-Cerberus Guard can submit suspicious local process files to a CAPE sandbox from the backend. For the full server-side setup, reverse proxy guidance and token handling, see `CAPE_SETUP.md`.
+Cerberus Guard can submit suspicious local process files either to an external CAPE sandbox or to the built-in `Cerberus Lab` reverse-analysis pipeline from the backend. `Cerberus Lab` now supports an optional Windows-Sandbox-based dynamic execution stage in addition to static reverse analysis. You can also upload a downloaded file bundle directly from the browser in `Dashboard -> Sandbox Analyses`; the UI calculates a local SHA-256 preview for the primary sample before the backend performs the persisted analysis, and extra uploaded files are staged as sidecars for dynamic execution. For local process-path analyses, Cerberus Lab also auto-discovers adjacent DLL and manifest sidecars where possible. Stored sandbox results can also be exported as PDF reports directly from the UI. For the full CAPE server-side setup, reverse proxy guidance and token handling, see `CAPE_SETUP.md`.
+
+When using a local LLM runtime such as LM Studio or Ollama, `Settings -> Sandbox -> Prioritize sandbox over traffic LLM` defers new traffic deep-inspection requests while Cerberus Lab is actively reviewing a file, so sandbox analyst summaries do not get starved behind normal traffic prompts.
 
 ## Supported LLM providers
 

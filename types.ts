@@ -9,8 +9,18 @@ export type DeploymentMode = 'standalone' | 'hub' | 'agent';
 export type PayloadMaskingMode = 'strict' | 'raw_local_only';
 
 export type ThreatIntelFeedFormat = 'plain' | 'spamhaus_drop' | 'json_array';
-export type SandboxProvider = 'none' | 'cape';
+export type SandboxProvider = 'none' | 'cape' | 'cerberus_lab';
 export type SandboxAnalysisStatus = 'queued' | 'running' | 'completed' | 'failed';
+export type SandboxAnalysisStage =
+  | 'queued'
+  | 'static_analysis'
+  | 'submitting'
+  | 'waiting_for_report'
+  | 'launching_sandbox'
+  | 'guest_execution'
+  | 'collecting_results'
+  | 'completed'
+  | 'failed';
 export type SandboxVerdict = 'malicious' | 'suspicious' | 'clean' | 'unknown';
 
 export type ProcessResolutionStrategy = 'exact' | 'listener' | 'local_port' | 'unresolved';
@@ -81,6 +91,7 @@ export type AnalysisDecisionSource =
   | 'custom_rule'
   | 'llm'
   | 'cache'
+  | 'backpressure'
   | 'replay'
   | 'threat_intel'
   | 'fleet_sync';
@@ -169,6 +180,8 @@ export interface SandboxAnalysisSummary {
   createdAt: string;
   updatedAt: string;
   status: SandboxAnalysisStatus;
+  stage: SandboxAnalysisStage;
+  stageMessage: string | null;
   provider: SandboxProvider;
   verdict: SandboxVerdict;
   summary: string;
@@ -183,8 +196,21 @@ export interface SandboxAnalysisSummary {
   reportUrl: string | null;
   errorMessage: string | null;
   signatures: string[];
+  reportReady: boolean;
+  reportPendingReason: string | null;
   sensorId: string;
   sensorName: string;
+}
+
+export interface SandboxLlmDebugPayload {
+  analysisId: string;
+  fileName: string;
+  provider: SandboxProvider;
+  updatedAt: string;
+  reportReady: boolean;
+  reportPendingReason: string | null;
+  llmReview: Record<string, unknown> | null;
+  llmReviewDebug: Record<string, unknown> | null;
 }
 
 export interface CaptureInterface {
@@ -374,6 +400,7 @@ export interface Configuration {
   liveRawFeedEnabled: boolean;
   firewallIntegrationEnabled: boolean;
   pcapBufferSize: number;
+  localLlmTimeoutSeconds: number;
   payloadMaskingMode: PayloadMaskingMode;
   sandboxEnabled: boolean;
   sandboxProvider: SandboxProvider;
@@ -382,6 +409,9 @@ export interface Configuration {
   sandboxPollingIntervalMs: number;
   sandboxTimeoutSeconds: number;
   sandboxAutoSubmitSuspicious: boolean;
+  sandboxPrioritizeLlmWorkloads: boolean;
+  sandboxDynamicExecutionEnabled: boolean;
+  sandboxDynamicRuntimeSeconds: number;
   threatIntelEnabled: boolean;
   threatIntelRefreshHours: number;
   threatIntelAutoBlock: boolean;
@@ -396,6 +426,7 @@ export interface Configuration {
 export type ServerConfiguration = Omit<Configuration, 'backendBaseUrl'>;
 
 export interface BootstrapPayload {
+  serverInstanceId: string;
   config: ServerConfiguration;
   interfaces: CaptureInterface[];
   captureStatus: CaptureStatusPayload;

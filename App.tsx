@@ -9,6 +9,9 @@ import { ThreatHunter } from './components/ThreatHunter';
 import {
   buildTrafficWebSocketUrl,
   analyzeProcessFileInSandbox,
+  retrySandboxAnalystReview,
+  analyzeUploadedFileInSandbox,
+  getSandboxLlmDebug,
   getBootstrap,
   getBackendHealth,
   listCaptureInterfaces,
@@ -18,7 +21,9 @@ import {
   stopCapture,
   updateConfig,
   getArtifactDownloadUrl,
+  getSandboxReportDownloadUrl,
   refreshThreatIntel,
+  normalizeBaseUrl,
 } from './services/backendService';
 import { getProviderDefinition, getSelectedProviderSettings } from './services/llmProviders';
 import {
@@ -34,6 +39,7 @@ import {
   Packet,
   PcapArtifact,
   SandboxAnalysisSummary,
+  SandboxLlmDebugPayload,
   ReplayStatusPayload,
   SensorSummary,
   ThreatIntelStatus,
@@ -41,7 +47,7 @@ import {
   TrafficMetricPoint,
 } from './types';
 import { useLocalization } from './hooks/useLocalization';
-import { createId, getInitialConfig, saveClientPreferences } from './utils';
+import { createId, getInitialConfig, getLastSeenServerInstanceId, markSeenServerInstance, saveClientPreferences } from './utils';
 
 const MAX_LOG_ENTRIES = 500;
 const MAX_FEED_ENTRIES = 100;
@@ -51,6 +57,7 @@ const MAX_SANDBOX_ANALYSES = 25;
 const CONFIG_SYNC_DELAY_MS = 700;
 const BACKEND_SWITCH_DELAY_MS = 500;
 const SOCKET_RECONNECT_DELAY_MS = 3000;
+const DISCONNECTED_REFRESH_INTERVAL_MS = 5000;
 
 type NavigationTab = 'Dashboard' | 'Rules' | 'Settings' | 'Logs' | 'Fleet' | 'ThreatHunt';
 type ConfigSyncState = 'idle' | 'saving' | 'saved' | 'error';
@@ -138,12 +145,13 @@ const App: React.FC = () => {
   const configSyncTimerRef = useRef<number | null>(null);
   const configSyncStateTimerRef = useRef<number | null>(null);
   const bootstrapRequestIdRef = useRef(0);
-  const activeBaseUrlRef = useRef(config.backendBaseUrl);
+  const activeBaseUrlRef = useRef(normalizeBaseUrl(config.backendBaseUrl));
   const configRef = useRef(config);
   const backendContextReadyRef = useRef(false);
   const isDisposedRef = useRef(false);
   const lastServerConfigRef = useRef(serializeServerConfig(config));
   const selectedSensorIdRef = useRef<string | null>(null);
+  const lastSeenServerInstanceIdRef = useRef<string | null>(getLastSeenServerInstanceId());
 
   useEffect(() => {
     configRef.current = config;
@@ -186,6 +194,29 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const resetFrontendState = useCallback(() => {
+    backendContextReadyRef.current = false;
+    selectedSensorIdRef.current = null;
+
+    startTransition(() => {
+      setLogs([]);
+      setLiveTrafficFeed([]);
+      setRawPacketFeed([]);
+      setTrafficMetrics([]);
+      setArtifacts([]);
+      setSandboxAnalyses([]);
+      setAvailableInterfaces([]);
+      setSensors([]);
+      setSelectedSensorId(null);
+      setMetricsSnapshot(createInitialMetricSnapshot());
+      setMonitoringStatus(createInitialMonitoringStatus());
+      setCaptureActionPending(false);
+      setReplayActionPending(false);
+      setThreatIntelRefreshPending(false);
+      setConfigSyncState('idle');
+    });
+  }, []);
+
   const closeTrafficSocket = useCallback(() => {
     clearReconnectTimer();
     if (websocketRef.current) {
@@ -207,20 +238,57 @@ const App: React.FC = () => {
     }));
   }, []);
 
+  const markConfigSyncSaved = useCallback(() => {
+    setConfigSyncState('saved');
+    if (configSyncStateTimerRef.current !== null) {
+      window.clearTimeout(configSyncStateTimerRef.current);
+    }
+    configSyncStateTimerRef.current = window.setTimeout(() => {
+      setConfigSyncState('idle');
+      configSyncStateTimerRef.current = null;
+    }, 1500);
+  }, []);
+
   const hydrateFromBackend = useCallback(async (baseUrl: string, options?: { preserveRawFeed?: boolean; sensorId?: string | null }) => {
     const requestId = ++bootstrapRequestIdRef.current;
 
     try {
       const payload = await getBootstrap(baseUrl, options?.sensorId ?? selectedSensorIdRef.current);
-      if (isDisposedRef.current || requestId !== bootstrapRequestIdRef.current || payload.config.backendBaseUrl !== activeBaseUrlRef.current) {
+      if (
+        isDisposedRef.current
+        || requestId !== bootstrapRequestIdRef.current
+        || normalizeBaseUrl(payload.config.backendBaseUrl) !== normalizeBaseUrl(activeBaseUrlRef.current)
+      ) {
         return;
       }
+
+      const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+      const instanceChanged = lastSeenServerInstanceIdRef.current !== null
+        && lastSeenServerInstanceIdRef.current !== payload.serverInstanceId;
+      const requestedSensorId = options?.sensorId ?? selectedSensorIdRef.current;
+      const nextSelectedSensorId = payload.sensors.some(sensor => sensor.id === requestedSensorId)
+        ? requestedSensorId
+        : null;
+
+      lastSeenServerInstanceIdRef.current = payload.serverInstanceId;
+      markSeenServerInstance({ backendBaseUrl: normalizedBaseUrl }, payload.serverInstanceId);
 
       backendContextReadyRef.current = true;
       lastServerConfigRef.current = serializeServerConfig(payload.config);
       setReplayActionPending(payload.replayStatus.state === 'running');
 
       startTransition(() => {
+        if (instanceChanged) {
+          setLogs([]);
+          setLiveTrafficFeed([]);
+          setRawPacketFeed([]);
+          setTrafficMetrics([]);
+          setArtifacts([]);
+          setSandboxAnalyses([]);
+          setSensors([]);
+          setMetricsSnapshot(createInitialMetricSnapshot());
+          setMonitoringStatus(createInitialMonitoringStatus());
+        }
         setConfig(payload.config);
         setAvailableInterfaces(payload.interfaces);
         setLogs(payload.logs.slice(0, MAX_LOG_ENTRIES));
@@ -233,6 +301,7 @@ const App: React.FC = () => {
         setSandboxAnalyses(payload.sandboxAnalyses.slice(0, MAX_SANDBOX_ANALYSES));
         setMetricsSnapshot(payload.metrics);
         setSensors(payload.sensors);
+        setSelectedSensorId(nextSelectedSensorId);
         setMonitoringStatus(previousStatus => ({
           ...previousStatus,
           backendReachable: true,
@@ -448,11 +517,36 @@ const App: React.FC = () => {
     }
   }, [appendClientLog, t]);
 
+  const syncConfigNow = useCallback(async () => {
+    if (!backendContextReadyRef.current) {
+      return configRef.current;
+    }
+
+    const pendingConfig = configRef.current;
+    const serializedConfig = serializeServerConfig(pendingConfig);
+    if (serializedConfig === lastServerConfigRef.current) {
+      return pendingConfig;
+    }
+
+    clearConfigSyncTimers();
+    setConfigSyncState('saving');
+
+    const nextConfig = await updateConfig(pendingConfig);
+    backendContextReadyRef.current = true;
+    lastServerConfigRef.current = serializeServerConfig(nextConfig);
+    startTransition(() => {
+      setConfig(nextConfig);
+    });
+    markConfigSyncSaved();
+    return nextConfig;
+  }, [clearConfigSyncTimers, markConfigSyncSaved]);
+
   const startMonitoring = useCallback(async () => {
     setCaptureActionPending(true);
 
     try {
-      const response = await startCapture(configRef.current);
+      const syncedConfig = await syncConfigNow();
+      const response = await startCapture(syncedConfig);
       applyCaptureStatus(response.status);
     } catch (error) {
       const message = error instanceof Error ? error.message : t('unknownError');
@@ -465,7 +559,7 @@ const App: React.FC = () => {
     } finally {
       setCaptureActionPending(false);
     }
-  }, [appendClientLog, applyCaptureStatus, t]);
+  }, [appendClientLog, applyCaptureStatus, syncConfigNow, t]);
 
   const stopMonitoringGracefully = useCallback(async () => {
     setCaptureActionPending(true);
@@ -519,7 +613,8 @@ const App: React.FC = () => {
   const triggerThreatIntelRefresh = useCallback(async () => {
     setThreatIntelRefreshPending(true);
     try {
-      const response = await refreshThreatIntel(configRef.current.backendBaseUrl);
+      const syncedConfig = await syncConfigNow();
+      const response = await refreshThreatIntel(syncedConfig.backendBaseUrl);
       setMonitoringStatus(previousStatus => ({
         ...previousStatus,
         threatIntelStatus: response.status,
@@ -535,7 +630,7 @@ const App: React.FC = () => {
     } finally {
       setThreatIntelRefreshPending(false);
     }
-  }, [appendClientLog, t]);
+  }, [appendClientLog, syncConfigNow, t]);
 
   const revealProcessPath = useCallback(async (targetPath: string) => {
     try {
@@ -552,7 +647,8 @@ const App: React.FC = () => {
     options?: { processName?: string | null; trafficEventId?: string | null }
   ) => {
     try {
-      const response = await analyzeProcessFileInSandbox(configRef.current.backendBaseUrl, targetPath, options);
+      const syncedConfig = await syncConfigNow();
+      const response = await analyzeProcessFileInSandbox(syncedConfig.backendBaseUrl, targetPath, options);
       startTransition(() => {
         setSandboxAnalyses(previousAnalyses => mergeById(previousAnalyses, response.analysis, MAX_SANDBOX_ANALYSES));
       });
@@ -566,30 +662,76 @@ const App: React.FC = () => {
       });
       throw error;
     }
+  }, [appendClientLog, syncConfigNow, t]);
+
+  const analyzeUploadedFileInSandboxViaUi = useCallback(async (files: File[]) => {
+    try {
+      const syncedConfig = await syncConfigNow();
+      const response = await analyzeUploadedFileInSandbox(syncedConfig.backendBaseUrl, files);
+      startTransition(() => {
+        setSandboxAnalyses(previousAnalyses => mergeById(previousAnalyses, response.analysis, MAX_SANDBOX_ANALYSES));
+      });
+      return response.analysis;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('sandboxUploadFailed'), LogLevel.ERROR, {
+        error: message,
+        fileName: files[0]?.name || null,
+        attachmentCount: Math.max(0, files.length - 1),
+      });
+      throw error;
+    }
+  }, [appendClientLog, syncConfigNow, t]);
+
+  const loadSandboxLlmDebug = useCallback(async (analysisId: string): Promise<SandboxLlmDebugPayload> => {
+    try {
+      const response = await getSandboxLlmDebug(configRef.current.backendBaseUrl, analysisId);
+      return response.debug;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('sandboxDebugLoadFailed'), LogLevel.ERROR, {
+        error: message,
+        analysisId,
+      });
+      throw error;
+    }
   }, [appendClientLog, t]);
 
+  const retrySandboxAnalystReviewViaUi = useCallback(async (analysisId: string) => {
+    try {
+      const syncedConfig = await syncConfigNow();
+      const response = await retrySandboxAnalystReview(syncedConfig.backendBaseUrl, analysisId);
+      startTransition(() => {
+        setSandboxAnalyses(previousAnalyses => mergeById(previousAnalyses, response.analysis, MAX_SANDBOX_ANALYSES));
+      });
+      return response.analysis;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('unknownError');
+      appendClientLog(t('sandboxRetryReviewFailed'), LogLevel.ERROR, {
+        error: message,
+        analysisId,
+      });
+      throw error;
+    }
+  }, [appendClientLog, syncConfigNow, t]);
+
   useEffect(() => {
-    activeBaseUrlRef.current = config.backendBaseUrl.trim() || 'http://localhost:8081';
+    const normalizedBaseUrl = normalizeBaseUrl(config.backendBaseUrl);
+    activeBaseUrlRef.current = normalizedBaseUrl;
     saveClientPreferences({ backendBaseUrl: activeBaseUrlRef.current });
 
-    backendContextReadyRef.current = false;
-    setMonitoringStatus(previousStatus => ({
-      ...previousStatus,
-      backendReachable: false,
-      websocketConnected: false,
-      lastError: null,
-    }));
+    closeTrafficSocket();
+    resetFrontendState();
 
     const timeoutId = window.setTimeout(() => {
-      closeTrafficSocket();
-      void hydrateFromBackend(activeBaseUrlRef.current, { sensorId: selectedSensorIdRef.current });
-      connectTrafficSocket(activeBaseUrlRef.current);
+      void hydrateFromBackend(normalizedBaseUrl, { sensorId: selectedSensorIdRef.current });
+      connectTrafficSocket(normalizedBaseUrl, true);
     }, BACKEND_SWITCH_DELAY_MS);
 
     return () => {
       window.clearTimeout(timeoutId);
     };
-  }, [config.backendBaseUrl, closeTrafficSocket, connectTrafficSocket, hydrateFromBackend]);
+  }, [config.backendBaseUrl, closeTrafficSocket, connectTrafficSocket, hydrateFromBackend, resetFrontendState]);
 
   useEffect(() => {
     if (!backendContextReadyRef.current) {
@@ -611,11 +753,7 @@ const App: React.FC = () => {
         startTransition(() => {
           setConfig(nextConfig);
         });
-        setConfigSyncState('saved');
-        configSyncStateTimerRef.current = window.setTimeout(() => {
-          setConfigSyncState('idle');
-          configSyncStateTimerRef.current = null;
-        }, 1500);
+        markConfigSyncSaved();
       }).catch(error => {
         const message = error instanceof Error ? error.message : t('unknownError');
         setConfigSyncState('error');
@@ -635,7 +773,7 @@ const App: React.FC = () => {
         configSyncTimerRef.current = null;
       }
     };
-  }, [appendClientLog, clearConfigSyncTimers, config, t]);
+  }, [appendClientLog, clearConfigSyncTimers, config, markConfigSyncSaved, t]);
 
   useEffect(() => {
     if (!backendContextReadyRef.current) {
@@ -665,6 +803,23 @@ const App: React.FC = () => {
       window.clearInterval(intervalId);
     };
   }, [t]);
+
+  useEffect(() => {
+    if (!monitoringStatus.backendReachable || monitoringStatus.websocketConnected) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void hydrateFromBackend(configRef.current.backendBaseUrl, {
+        preserveRawFeed: true,
+        sensorId: selectedSensorIdRef.current,
+      });
+    }, DISCONNECTED_REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [hydrateFromBackend, monitoringStatus.backendReachable, monitoringStatus.websocketConnected]);
 
   useEffect(() => () => {
     isDisposedRef.current = true;
@@ -716,6 +871,9 @@ const App: React.FC = () => {
             onStartReplay={startReplayCapture}
             onRevealProcessPath={revealProcessPath}
             onAnalyzeProcessInSandbox={analyzeProcessInSandbox}
+            onAnalyzeUploadedFileInSandbox={analyzeUploadedFileInSandboxViaUi}
+            onLoadSandboxLlmDebug={loadSandboxLlmDebug}
+            onRetrySandboxAnalystReview={retrySandboxAnalystReviewViaUi}
             monitoringStatus={monitoringStatus}
             llmStatus={llmStatus}
             metricsSnapshot={metricsSnapshot}
@@ -726,6 +884,7 @@ const App: React.FC = () => {
             sandboxAnalyses={sensorScopedSandboxAnalyses}
             rawFeedEnabled={config.liveRawFeedEnabled}
             getArtifactDownloadUrl={(artifactId) => getArtifactDownloadUrl(config.backendBaseUrl, artifactId)}
+            getSandboxReportDownloadUrl={(analysisId) => getSandboxReportDownloadUrl(config.backendBaseUrl, analysisId)}
             sensors={sensors}
             selectedSensorId={selectedSensorId}
             onSelectSensor={setSelectedSensorId}

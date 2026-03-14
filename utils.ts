@@ -2,8 +2,17 @@ import { Configuration, ThreatIntelSource } from './types';
 import { createDefaultProviderSettings } from './services/llmProviders';
 
 const CLIENT_PREFERENCES_KEY = 'cerberusClientPreferences';
+const CLIENT_PREFERENCES_VERSION = 2;
 const DEFAULT_BACKEND_BASE_URL = 'http://localhost:8081';
 const LEGACY_BACKEND_BASE_URL = 'http://localhost:8080';
+
+const normalizeBackendBaseUrl = (backendBaseUrl: string) => backendBaseUrl.trim().replace(/\/+$/, '') || DEFAULT_BACKEND_BASE_URL;
+
+interface ClientPreferences {
+  version: number;
+  backendBaseUrl: string;
+  lastServerInstanceId: string | null;
+}
 
 const createDefaultThreatIntelSources = (): ThreatIntelSource[] => [
   {
@@ -23,6 +32,36 @@ const createDefaultThreatIntelSources = (): ThreatIntelSource[] => [
 ];
 
 export const createId = () => crypto.randomUUID();
+
+const loadClientPreferences = (): ClientPreferences | null => {
+  const savedPreferences = localStorage.getItem(CLIENT_PREFERENCES_KEY);
+  if (!savedPreferences) {
+    return null;
+  }
+
+  const parsed = JSON.parse(savedPreferences) as {
+    version?: unknown;
+    backendBaseUrl?: unknown;
+    lastServerInstanceId?: unknown;
+  };
+
+  if (typeof parsed.backendBaseUrl !== 'string' || !parsed.backendBaseUrl.trim()) {
+    return null;
+  }
+
+  const normalizedBackendBaseUrl = normalizeBackendBaseUrl(parsed.backendBaseUrl);
+  const migratedBackendBaseUrl = normalizedBackendBaseUrl === LEGACY_BACKEND_BASE_URL
+    ? DEFAULT_BACKEND_BASE_URL
+    : normalizedBackendBaseUrl;
+
+  return {
+    version: typeof parsed.version === 'number' ? parsed.version : 1,
+    backendBaseUrl: migratedBackendBaseUrl,
+    lastServerInstanceId: typeof parsed.lastServerInstanceId === 'string' && parsed.lastServerInstanceId.trim()
+      ? parsed.lastServerInstanceId.trim()
+      : null,
+  };
+};
 
 const createDefaultConfig = (backendBaseUrl: string): Configuration => ({
   llmProvider: 'lmstudio',
@@ -46,14 +85,18 @@ const createDefaultConfig = (backendBaseUrl: string): Configuration => ({
   liveRawFeedEnabled: false,
   firewallIntegrationEnabled: false,
   pcapBufferSize: 10,
+  localLlmTimeoutSeconds: 300,
   payloadMaskingMode: 'raw_local_only',
-  sandboxEnabled: false,
-  sandboxProvider: 'cape',
+  sandboxEnabled: true,
+  sandboxProvider: 'cerberus_lab',
   sandboxBaseUrl: 'http://localhost:8090',
   sandboxApiKey: '',
   sandboxPollingIntervalMs: 5000,
   sandboxTimeoutSeconds: 300,
   sandboxAutoSubmitSuspicious: false,
+  sandboxPrioritizeLlmWorkloads: true,
+  sandboxDynamicExecutionEnabled: true,
+  sandboxDynamicRuntimeSeconds: 45,
   threatIntelEnabled: false,
   threatIntelRefreshHours: 24,
   threatIntelAutoBlock: false,
@@ -67,15 +110,9 @@ const createDefaultConfig = (backendBaseUrl: string): Configuration => ({
 
 export const getInitialConfig = (): Configuration => {
   try {
-    const savedPreferences = localStorage.getItem(CLIENT_PREFERENCES_KEY);
-    if (savedPreferences) {
-      const parsed = JSON.parse(savedPreferences) as { backendBaseUrl?: unknown };
-      if (typeof parsed.backendBaseUrl === 'string' && parsed.backendBaseUrl.trim()) {
-        const normalizedBackendBaseUrl = parsed.backendBaseUrl.trim() === LEGACY_BACKEND_BASE_URL
-          ? DEFAULT_BACKEND_BASE_URL
-          : parsed.backendBaseUrl.trim();
-        return createDefaultConfig(normalizedBackendBaseUrl);
-      }
+    const savedPreferences = loadClientPreferences();
+    if (savedPreferences?.backendBaseUrl) {
+      return createDefaultConfig(savedPreferences.backendBaseUrl);
     }
   } catch (error) {
     console.error('Failed to load client preferences from localStorage', error);
@@ -84,12 +121,37 @@ export const getInitialConfig = (): Configuration => {
   return createDefaultConfig(DEFAULT_BACKEND_BASE_URL);
 };
 
-export const saveClientPreferences = (config: Pick<Configuration, 'backendBaseUrl'>) => {
+export const saveClientPreferences = (config: Pick<Configuration, 'backendBaseUrl'>, options?: { lastServerInstanceId?: string | null }) => {
+  const existingPreferences = (() => {
+    try {
+      return loadClientPreferences();
+    } catch {
+      return null;
+    }
+  })();
+
   try {
     localStorage.setItem(CLIENT_PREFERENCES_KEY, JSON.stringify({
-      backendBaseUrl: config.backendBaseUrl.trim() || DEFAULT_BACKEND_BASE_URL,
+      version: CLIENT_PREFERENCES_VERSION,
+      backendBaseUrl: normalizeBackendBaseUrl(config.backendBaseUrl),
+      lastServerInstanceId: options?.lastServerInstanceId
+        ?? existingPreferences?.lastServerInstanceId
+        ?? null,
     }));
   } catch (error) {
     console.error('Failed to save client preferences to localStorage', error);
   }
+};
+
+export const getLastSeenServerInstanceId = (): string | null => {
+  try {
+    return loadClientPreferences()?.lastServerInstanceId ?? null;
+  } catch (error) {
+    console.error('Failed to load server instance id from localStorage', error);
+    return null;
+  }
+};
+
+export const markSeenServerInstance = (config: Pick<Configuration, 'backendBaseUrl'>, serverInstanceId: string) => {
+  saveClientPreferences(config, { lastServerInstanceId: serverInstanceId });
 };

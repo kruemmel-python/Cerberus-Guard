@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import {
   getServerConfiguration,
+  getSandboxAnalysisById,
   insertLogEntry,
   insertPcapArtifact,
   insertTrafficEvent,
@@ -30,6 +31,7 @@ import { ProcessResolver } from './processResolver.js';
 import { SandboxService } from './sandboxService.js';
 
 const createId = () => crypto.randomUUID();
+const THREAT_INCIDENT_COOLDOWN_MS = 15_000;
 
 const createReplayStatus = () => ({
   state: 'idle',
@@ -54,6 +56,7 @@ export class MonitoringService {
       lastUpdatedAt: new Date().toISOString(),
     };
     this.replayStatus = createReplayStatus();
+    this.recentThreatIncidents = new Map();
     this.fleetStatus = {
       deploymentMode: this.configuration.deploymentMode,
       sensorId: this.configuration.sensorId,
@@ -110,6 +113,12 @@ export class MonitoringService {
     this.sandboxService = new SandboxService({
       onLog: (level, message, details) => {
         this.emitLog(level, message, details);
+      },
+      onAnalysisUpdate: analysis => {
+        this.broadcast({
+          type: 'sandbox-analysis',
+          payload: analysis,
+        });
       },
     });
     this.threatIntelService = new ThreatIntelService({
@@ -273,6 +282,7 @@ export class MonitoringService {
   }
 
   getBootstrapPayload(clientCount = 0, sensorId = null) {
+    this.sandboxService.pruneStaleAnalyses({ sensorId });
     const sensors = listSensors();
     return {
       config: this.getClientConfiguration(),
@@ -295,6 +305,58 @@ export class MonitoringService {
       sensors,
       threatIntelStatus: this.threatIntelStatus,
     };
+  }
+
+  listSandboxAnalyses(limit = 25, sensorId = null) {
+    this.sandboxService.pruneStaleAnalyses({ sensorId });
+    return listRecentSandboxAnalyses(limit, sensorId);
+  }
+
+  shouldDeferTrafficLlmInspection() {
+    if (!this.configuration.sandboxPrioritizeLlmWorkloads) {
+      return false;
+    }
+
+    const providerDefinition = getProviderDefinition(this.configuration.llmProvider);
+    if (!providerDefinition?.local) {
+      return false;
+    }
+
+    if (this.configuration.sandboxProvider !== 'cerberus_lab') {
+      return false;
+    }
+
+    return this.sandboxService.hasActiveAnalyses();
+  }
+
+  pruneThreatIncidentCooldowns(cutoffTimestamp) {
+    for (const [incidentKey, lastSeenAt] of this.recentThreatIncidents.entries()) {
+      if (lastSeenAt < cutoffTimestamp) {
+        this.recentThreatIncidents.delete(incidentKey);
+      }
+    }
+  }
+
+  shouldEmitThreatIncident(packet, analysisResult, actionType) {
+    const isThreat = analysisResult.isSuspicious || actionType === 'BLOCK' || actionType === 'REDIRECT';
+    if (!isThreat) {
+      return false;
+    }
+
+    const now = Date.now();
+    this.pruneThreatIncidentCooldowns(now - THREAT_INCIDENT_COOLDOWN_MS);
+
+    const incidentKey = [
+      packet.sourceIp,
+      packet.destinationIp,
+      packet.destinationPort,
+      packet.protocol,
+      analysisResult.attackType,
+      actionType,
+    ].join('|');
+    const lastSeenAt = this.recentThreatIncidents.get(incidentKey) ?? 0;
+    this.recentThreatIncidents.set(incidentKey, now);
+    return now - lastSeenAt >= THREAT_INCIDENT_COOLDOWN_MS;
   }
 
   emitLog(level, message, details, overrides = {}) {
@@ -554,6 +616,16 @@ export class MonitoringService {
 
         if (heuristicEvaluation.result && !heuristicEvaluation.needsDeepInspection) {
           analysisResult = heuristicEvaluation.result;
+        } else if (this.shouldDeferTrafficLlmInspection()) {
+          analysisResult = {
+            isSuspicious: false,
+            attackType: 'none',
+            confidence: 0.12,
+            explanation: 'Deep inspection was deferred because Cerberus Lab currently has priority on the local LLM runtime.',
+            packet,
+            decisionSource: 'backpressure',
+            matchedSignals: ['llm.backpressure.sandbox_priority'],
+          };
         } else {
           analysisResult = await this.analysisCoordinator.analyze(packet, this.configuration);
         }
@@ -573,6 +645,8 @@ export class MonitoringService {
       }
     }
 
+    const shouldEmitThreatIncident = this.shouldEmitThreatIncident(packet, analysisResult, actionType);
+
     if (actionType === 'BLOCK' && this.configuration.autoBlockThreats && !this.configuration.blockedIps.includes(packet.sourceIp)) {
       this.configuration.blockedIps.push(packet.sourceIp);
       saveServerConfiguration(this.configuration);
@@ -581,7 +655,7 @@ export class MonitoringService {
       });
     }
 
-    if (actionType === 'BLOCK' && this.configuration.firewallIntegrationEnabled) {
+    if (shouldEmitThreatIncident && actionType === 'BLOCK' && this.configuration.firewallIntegrationEnabled) {
       try {
         const firewallResult = await this.firewallManager.blockIp(packet.sourceIp);
         firewallApplied = firewallResult.applied;
@@ -594,7 +668,7 @@ export class MonitoringService {
       }
     }
 
-    if (analysisResult.isSuspicious || actionType === 'BLOCK' || actionType === 'REDIRECT') {
+    if (shouldEmitThreatIncident) {
       this.emitLog(actionType === 'BLOCK' ? 'CRITICAL' : 'WARN', 'Threat detected.', {
         sourceIp: packet.sourceIp,
         destinationPort: packet.destinationPort,
@@ -639,7 +713,7 @@ export class MonitoringService {
       }
     }
 
-    if (analysisResult.isSuspicious || actionType === 'BLOCK' || actionType === 'REDIRECT') {
+    if (shouldEmitThreatIncident) {
       const enabledWebhooks = this.configuration.webhookIntegrations.filter(destination => destination.enabled && destination.url);
       if (enabledWebhooks.length > 0) {
         try {
@@ -666,7 +740,7 @@ export class MonitoringService {
       }
     }
 
-    if (actionType === 'BLOCK' && this.configuration.globalBlockPropagationEnabled) {
+    if (shouldEmitThreatIncident && actionType === 'BLOCK' && this.configuration.globalBlockPropagationEnabled) {
       this.fleetService.propagateGlobalBlock(packet.sourceIp, {
         reason: analysisResult.explanation,
       });
@@ -758,6 +832,8 @@ export class MonitoringService {
       trafficEventId,
       sensorId: this.configuration.sensorId,
       sensorName: this.configuration.sensorName,
+    }, {
+      requireEnabled: false,
     });
 
     this.broadcast({
@@ -766,5 +842,48 @@ export class MonitoringService {
     });
 
     return analysis;
+  }
+
+  async analyzeUploadedFile({ filePath, fileName, attachments = [] }) {
+    const analysis = await this.sandboxService.analyzeFile(filePath, {
+      fileName,
+      sidecarFiles: attachments,
+      processName: null,
+      trafficEventId: null,
+      sensorId: this.configuration.sensorId,
+      sensorName: this.configuration.sensorName,
+    }, {
+      requireEnabled: false,
+    });
+
+    this.broadcast({
+      type: 'sandbox-analysis',
+      payload: analysis,
+    });
+
+    return analysis;
+  }
+
+  async retrySandboxAnalystReview(analysisId) {
+    const analysis = getSandboxAnalysisById(analysisId, { includeRaw: true });
+    if (!analysis) {
+      throw new Error('Sandbox analysis not found.');
+    }
+
+    if (analysis.provider !== 'cerberus_lab') {
+      throw new Error('Only Cerberus Lab analyses support analyst-review retry.');
+    }
+
+    if (analysis.status !== 'completed') {
+      throw new Error('Analyst review can only be retried for completed analyses.');
+    }
+
+    const refreshedAnalysis = await this.sandboxService.refreshExistingAnalysis(analysis, { force: true });
+    this.broadcast({
+      type: 'sandbox-analysis',
+      payload: refreshedAnalysis,
+    });
+
+    return refreshedAnalysis;
   }
 }

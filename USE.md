@@ -56,6 +56,10 @@ local-model
 ```
 
 Wenn LM Studio bei dir exakt `local-model` bereitstellt, musst du nichts aendern.
+
+Wenn du `local-model` unveraendert laesst, verwendet Cerberus Guard zur Laufzeit automatisch ein bereits in LM Studio geladenes Modell. Ist noch kein Modell im Speicher geladen, meldet NetGuard das jetzt explizit und verweist auf `lms load <model>`.
+
+Cerberus Guard behandelt Payloads, extrahierte Strings, Pseudocode und andere Datei-Inhalte grundsaetzlich als `untrusted evidence`. Eingebettete Anweisungen wie `ignore previous instructions` werden vor dem LLM-Prompt neutralisiert und als verdachtige Inhalte markiert, statt als echte Modellanweisung weitergegeben.
 Wenn LM Studio eine andere Modell-ID liefert, uebernimm exakt diesen Wert spaeter in `Settings`.
 
 Hinweis:
@@ -362,6 +366,107 @@ Fuer den produktiven Betrieb mit einem lokalen Modell:
 
 Fuer die komplette Server-Seite mit Token, Reverse Proxy, Netztrennung und API-Tests siehe auch `CAPE_SETUP.md`.
 
+Wenn du keinen externen Sandbox-Server betreiben willst, kannst du stattdessen in `Einstellungen -> Sandbox` den Provider `Cerberus Lab (lokale Reverse-Analyse)` auswaehlen. Dann fuehrt NetGuard die Datei lokal ueber seine eingebaute Reverse-Analysis-Pipeline aus: Quarantaene-Kopie, Hashing, Strings, PE-Imports, Entropie, decompiler-aehnlicher Pseudocode und optionaler LLM-Analystenbericht.
+
+### Cerberus Lab nutzen
+
+Standard auf einem frischen Start:
+
+- `Enable sandbox integration`: `an`
+- `Sandbox Provider`: `Cerberus Lab (lokale Reverse-Analyse)`
+- `Windows-Sandbox-Detonation aktivieren`: `an`
+- `Windows-Sandbox-Laufzeit (Sekunden)`: `45`
+
+Beispiel:
+
+- `Enable sandbox integration`: `an`
+- `Auto-submit suspicious processes`: `an` oder `aus`, je nach Geschmack
+- `Sandbox Provider`: `Cerberus Lab (lokale Reverse-Analyse)`
+- `LLM Provider`: z.B. `LM Studio`, wenn du zusaetzlich einen lokalen Analysten-Kurzbericht moechtest
+
+Danach kannst du im Live-Verkehrs-Feed beim lokalen Prozess auf `In Sandbox analysieren` klicken. Der erzeugte Bericht enthaelt dann:
+
+- Quarantaene-Pfad der eingesandten Datei
+- `SHA-256`, `SHA-1`, `MD5`
+- extrahierte Strings und IoCs
+- PE-Metadaten, Import-Tabelle und Entropie
+- decompiler-aehnliche Pseudocode-Zusammenfassung
+- PDF-Export direkt aus dem Dashboard
+
+### Datei direkt aus der Web-UI pruefen
+
+Wenn du eine Datei bereits heruntergeladen hast und sie vor der Ausfuehrung erst in Cerberus pruefen willst, geht das jetzt direkt im Dashboard ohne laufenden Live-Traffic:
+
+1. Oeffne `Dashboard`
+2. Scrolle zum Bereich `Sandbox-Analysen`
+3. Ziehe die Datei oder ein kleines Dateibuendel auf die Upload-Flaeche oder klicke `Dateien auswaehlen`
+4. Pruefe in der Vorschau:
+   - Dateiname
+   - Groesse
+   - Typ
+   - lokal berechneter `SHA-256`
+5. Klicke `Hochgeladenes Buendel analysieren`
+
+Dann passiert real:
+
+1. Der Browser sendet die Datei an das NetGuard-Backend
+2. Das Backend legt sie kurz in `data/sandbox-uploads` ab
+3. Cerberus Lab oder CAPE analysiert das Sample
+4. Bei Cerberus Lab werden mitgelieferte Sidecars wie lokale DLLs oder Manifest-Dateien im selben Quarantaene-Bundle mitgestaged
+5. Die temporaeren Upload-Dateien werden wieder entfernt
+6. Das Ergebnis erscheint unter `Sandbox-Analysen`
+
+Wichtig:
+
+- Der Browser uebergibt aus Sicherheitsgruenden keinen echten lokalen Windows-Pfad, sondern nur Dateiname und Inhalt.
+- Wenn du fuer Dynamic-Analysen lokale DLLs oder Manifest-Dateien brauchst, lade sie im selben Upload direkt mit hoch.
+- Die Hash-Vorschau wird lokal im Browser berechnet, bevor die Datei an das Backend uebertragen wird.
+- Die eigentliche Analyse bleibt trotzdem serverseitig und wird wie alle anderen Sandbox-Ergebnisse persistent gespeichert.
+
+### Sidecars bei lokalen Prozessdateien
+
+Wenn du keine hochgeladene Datei, sondern einen lokal gefundenen Prozess aus dem Live-Feed in Cerberus Lab analysierst, versucht NetGuard jetzt automatisch benachbarte Sidecars mitzunehmen:
+
+- importierte DLLs aus dem gleichen Verzeichnis, wenn sie dort real vorhanden sind
+- `.manifest`-Dateien neben dem Sample
+
+Das verbessert Dynamic-Analysen bei Desktop-Programmen deutlich, weil EXEs wie Browser oder Launcher oft nicht ohne ihre lokalen DLLs starten.
+
+### Cerberus Lab mit Windows Sandbox erweitern
+
+Wenn dein Host `Windows Sandbox` unterstuetzt, kannst du Cerberus Lab um eine echte Gast-Ausfuehrung erweitern:
+
+- `Sandbox Provider`: `Cerberus Lab (lokale Reverse-Analyse)`
+- `Windows-Sandbox-Detonation aktivieren`: `an`
+- `Windows-Sandbox-Laufzeit (Sekunden)`: z.B. `45`
+
+Wichtig:
+
+- Der Host muss `Windows Sandbox` als Windows-Feature aktiviert haben.
+- Die Analyse braucht eine interaktive Desktop-Sitzung, weil Windows Sandbox als GUI-Gast gestartet wird.
+- NetGuard fuehrt die Datei zuerst statisch aus und startet danach einen ephemeren Windows-Sandbox-Gast fuer die Dynamic-Analyse.
+- Gerade bei groesseren Windows-Binaerdateien kann der komplette Gastlauf inklusive Start des Sandbox-Fensters mehrere Minuten dauern.
+
+Zusatznutzen der Dynamic-Analyse:
+
+- neue Prozesse und Kindprozesse
+- TCP-/UDP-Aktivitaet des gestarteten Samples
+- Datei-Aenderungen in typischen Benutzerpfaden
+- Autorun-Registry-Aenderungen
+- neu angelegte Windows-Dienste
+
+Diese Befunde landen ebenfalls im gespeicherten Sandbox-Eintrag und im PDF-Bericht.
+
+### Lokale LLM-Priorisierung fuer Sandbox-Analysen
+
+Wenn du `LM Studio` oder `Ollama` verwendest, aktiviere in `Einstellungen -> Sandbox` die Option `Sandbox vor Traffic-LLM priorisieren`.
+
+Dann gilt:
+
+- waehrend Cerberus Lab aktiv eine Datei analysiert, werden neue Traffic-Deep-Inspections voruebergehend nicht mehr an das lokale LLM geschickt
+- der Sandbox-Review bekommt Vorrang
+- dadurch kommen Analyst Review und PDF-Bericht stabiler durch, auch wenn parallel viel Live-Verkehr anliegt
+
 Wenn du verdaechtige lokale Prozesse direkt aus Cerberus Guard heraus analysieren willst, kannst du jetzt eine echte CAPE-Sandbox anbinden. Das Backend uebernimmt dabei den Dateiupload, das Polling des Tasks und die persistente Speicherung des Urteils.
 
 Wichtig:
@@ -465,6 +570,8 @@ und ein Verdict wie:
 - `Suspicious`
 - `Clean`
 - `Unknown`
+
+Zusaetzlich kannst du jeden gespeicherten Sandbox-Eintrag jetzt als `PDF-Bericht` direkt aus dem Bereich `Sandbox-Analysen` herunterladen.
 
 ### Auto-Submit spaeter aktivieren
 

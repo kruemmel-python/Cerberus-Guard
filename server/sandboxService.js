@@ -1,9 +1,16 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { getLatestSandboxAnalysisBySha256, upsertSandboxAnalysis } from './db.js';
+import { analyzeWithCerberusLab, refreshCerberusLabLlmReview } from './cerberusLabService.js';
+import {
+  deleteSandboxAnalysesByIds,
+  getLatestSandboxAnalysisBySha256,
+  listStalePendingSandboxAnalyses,
+  upsertSandboxAnalysis,
+} from './db.js';
 
 const MAX_SANDBOX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
+const STALE_PENDING_ANALYSIS_GRACE_SECONDS = 30;
 
 const sleep = ms => new Promise(resolve => {
   setTimeout(resolve, ms);
@@ -33,6 +40,15 @@ const ensureAbsoluteFilePath = async targetPath => {
   };
 };
 
+const normalizeUploadFileName = value => {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+
+  const normalizedName = path.basename(value.trim());
+  return normalizedName || null;
+};
+
 const hashFileSha256 = async targetPath => {
   const fileBuffer = await fs.readFile(targetPath);
   return {
@@ -47,6 +63,22 @@ const toNumber = value => {
 };
 
 const uniqueStrings = values => [...new Set(values.filter(Boolean).map(value => String(value).trim()).filter(Boolean))];
+
+const shouldReuseExistingCerberusAnalysis = (configuration, metadata = {}) => {
+  if (configuration?.sandboxProvider !== 'cerberus_lab') {
+    return true;
+  }
+
+  if (configuration?.sandboxDynamicExecutionEnabled) {
+    return false;
+  }
+
+  if (Array.isArray(metadata.sidecarFiles) && metadata.sidecarFiles.length > 0) {
+    return false;
+  }
+
+  return true;
+};
 
 const parseCapeTaskId = payload => {
   const directTaskId = payload?.task_id ?? payload?.taskId ?? payload?.data?.task_id ?? payload?.data?.taskId;
@@ -115,20 +147,98 @@ const buildSummary = (verdict, score, signatures, report) => {
 };
 
 export class SandboxService {
-  constructor({ onLog } = {}) {
+  constructor({ onLog, onAnalysisUpdate } = {}) {
     this.onLog = onLog;
+    this.onAnalysisUpdate = onAnalysisUpdate;
     this.configuration = null;
     this.inFlight = new Map();
+    this.inFlightAnalysisIds = new Set();
   }
 
   configure(configuration) {
     this.configuration = configuration;
+    this.pruneStaleAnalyses();
   }
 
   log(level, message, details) {
     if (this.onLog) {
       this.onLog(level, message, details);
     }
+  }
+
+  emitAnalysisUpdate(analysis) {
+    if (this.onAnalysisUpdate) {
+      this.onAnalysisUpdate(analysis);
+    }
+  }
+
+  getActiveAnalysisCount() {
+    return this.inFlight.size;
+  }
+
+  hasActiveAnalyses() {
+    return this.getActiveAnalysisCount() > 0;
+  }
+
+  persistAnalysis(analysis) {
+    const persistedAnalysis = upsertSandboxAnalysis({
+      ...analysis,
+      stage: analysis.stage ?? analysis.status,
+      stageMessage: analysis.stageMessage ?? null,
+    });
+    this.emitAnalysisUpdate(persistedAnalysis);
+    return persistedAnalysis;
+  }
+
+  async refreshExistingAnalysis(existingAnalysis, options = {}) {
+    if (!existingAnalysis || existingAnalysis.provider !== 'cerberus_lab' || existingAnalysis.status !== 'completed') {
+      return existingAnalysis;
+    }
+
+    const refreshedAnalysis = await refreshCerberusLabLlmReview({
+      analysis: existingAnalysis,
+      configuration: this.configuration,
+      force: options.force === true,
+    });
+
+    if (refreshedAnalysis !== existingAnalysis) {
+      return this.persistAnalysis(refreshedAnalysis);
+    }
+
+    return existingAnalysis;
+  }
+
+  getStalePendingCutoff(sensorId = null) {
+    const timeoutSeconds = Math.max(Number(this.configuration?.sandboxTimeoutSeconds) || 300, 30);
+    return {
+      sensorId,
+      updatedBefore: new Date(Date.now() - (timeoutSeconds + STALE_PENDING_ANALYSIS_GRACE_SECONDS) * 1000).toISOString(),
+    };
+  }
+
+  pruneStaleAnalyses({ sensorId = null } = {}) {
+    if (!this.configuration) {
+      return 0;
+    }
+
+    const { updatedBefore } = this.getStalePendingCutoff(sensorId);
+    const staleAnalyses = listStalePendingSandboxAnalyses(updatedBefore, sensorId)
+      .filter(analysis => !this.inFlightAnalysisIds.has(analysis.id));
+
+    if (staleAnalyses.length === 0) {
+      return 0;
+    }
+
+    const deletedCount = deleteSandboxAnalysesByIds(staleAnalyses.map(analysis => analysis.id));
+    if (deletedCount > 0) {
+      this.log('INFO', 'Removed stale sandbox analyses.', {
+        deletedCount,
+        updatedBefore,
+        sensorId,
+      });
+    }
+
+    return deletedCount;
   }
 
   buildAuthHeaders() {
@@ -142,16 +252,24 @@ export class SandboxService {
     };
   }
 
-  assertConfigured() {
-    if (!this.configuration?.sandboxEnabled) {
+  assertConfigured({ requireEnabled = true } = {}) {
+    if (requireEnabled && !this.configuration?.sandboxEnabled) {
       throw new Error('Sandbox integration is disabled.');
     }
 
-    if (this.configuration.sandboxProvider !== 'cape') {
+    if (!this.configuration) {
+      throw new Error('Sandbox service is not configured.');
+    }
+
+    if (this.configuration.sandboxProvider === 'none') {
+      throw new Error('Sandbox provider is disabled.');
+    }
+
+    if (!['cape', 'cerberus_lab'].includes(this.configuration.sandboxProvider)) {
       throw new Error(`Unsupported sandbox provider: ${this.configuration.sandboxProvider}`);
     }
 
-    if (!this.configuration.sandboxBaseUrl.trim()) {
+    if (this.configuration.sandboxProvider === 'cape' && !this.configuration.sandboxBaseUrl.trim()) {
       throw new Error('Sandbox base URL is not configured.');
     }
   }
@@ -230,14 +348,25 @@ export class SandboxService {
     throw new Error(`Sandbox task ${taskId} timed out after ${this.configuration.sandboxTimeoutSeconds} seconds.`);
   }
 
-  async analyzeFile(filePath, metadata = {}) {
-    this.assertConfigured();
+  async analyzeFile(filePath, metadata = {}, options = {}) {
+    this.assertConfigured({
+      requireEnabled: options.requireEnabled ?? true,
+    });
+
+    this.pruneStaleAnalyses();
 
     const fileInfo = await ensureAbsoluteFilePath(filePath);
+    const effectiveFileInfo = {
+      ...fileInfo,
+      fileName: normalizeUploadFileName(metadata.fileName) || fileInfo.fileName,
+    };
     const { buffer, sha256 } = await hashFileSha256(fileInfo.filePath);
-    const existingAnalysis = getLatestSandboxAnalysisBySha256(sha256, this.configuration.sandboxProvider);
+    const allowExistingAnalysisReuse = shouldReuseExistingCerberusAnalysis(this.configuration, metadata);
+    const existingAnalysis = allowExistingAnalysisReuse
+      ? getLatestSandboxAnalysisBySha256(sha256, this.configuration.sandboxProvider, { includeRaw: true })
+      : null;
     if (existingAnalysis && ['queued', 'running', 'completed'].includes(existingAnalysis.status)) {
-      return existingAnalysis;
+      return this.refreshExistingAnalysis(existingAnalysis);
     }
 
     const inFlightKey = `${this.configuration.sandboxProvider}:${sha256}`;
@@ -251,13 +380,15 @@ export class SandboxService {
       createdAt,
       updatedAt: createdAt,
       status: 'queued',
+      stage: 'queued',
+      stageMessage: 'Queued for sandbox submission.',
       provider: this.configuration.sandboxProvider,
       verdict: 'unknown',
       summary: 'Queued for sandbox submission.',
       score: null,
-      filePath: fileInfo.filePath,
-      fileName: fileInfo.fileName,
-      fileSize: fileInfo.fileSize,
+      filePath: effectiveFileInfo.filePath,
+      fileName: effectiveFileInfo.fileName,
+      fileSize: effectiveFileInfo.fileSize,
       sha256,
       processName: metadata.processName ?? null,
       trafficEventId: metadata.trafficEventId ?? null,
@@ -271,33 +402,98 @@ export class SandboxService {
     };
 
     const analysisPromise = (async () => {
-      let persistedAnalysis = upsertSandboxAnalysis(baseAnalysis);
+      this.inFlightAnalysisIds.add(baseAnalysis.id);
+      let persistedAnalysis = this.persistAnalysis(baseAnalysis);
 
       try {
-        const taskId = await this.submitCapeFile(fileInfo, buffer);
-        persistedAnalysis = upsertSandboxAnalysis({
-          ...persistedAnalysis,
-          updatedAt: new Date().toISOString(),
-          status: 'running',
-          summary: `Submitted to CAPE task ${taskId}.`,
-          externalTaskId: taskId,
-        });
+        let score = null;
+        let signatures = [];
+        let verdict = 'unknown';
+        let summary = 'Sandbox analysis completed.';
+        let raw = null;
+        let externalTaskId = null;
 
-        const report = await this.waitForCapeReport(taskId);
-        const score = extractScore(report);
-        const signatures = extractSignatures(report);
-        const verdict = determineVerdict(score, signatures);
-        const completedAnalysis = upsertSandboxAnalysis({
+        if (this.configuration.sandboxProvider === 'cape') {
+          persistedAnalysis = this.persistAnalysis({
+            ...persistedAnalysis,
+            updatedAt: new Date().toISOString(),
+            status: 'running',
+            stage: 'submitting',
+            stageMessage: 'Submitting sample to CAPE.',
+            summary: 'Submitting sample to CAPE.',
+          });
+
+          const taskId = await this.submitCapeFile(effectiveFileInfo, buffer);
+          persistedAnalysis = this.persistAnalysis({
+            ...persistedAnalysis,
+            updatedAt: new Date().toISOString(),
+            status: 'running',
+            stage: 'waiting_for_report',
+            stageMessage: `Waiting for CAPE report (task ${taskId}).`,
+            summary: `Submitted to CAPE task ${taskId}.`,
+            externalTaskId: taskId,
+          });
+
+          const report = await this.waitForCapeReport(taskId);
+          score = extractScore(report);
+          signatures = extractSignatures(report);
+          verdict = determineVerdict(score, signatures);
+          summary = buildSummary(verdict, score, signatures, report);
+          raw = report;
+          externalTaskId = taskId;
+        } else {
+          persistedAnalysis = this.persistAnalysis({
+            ...persistedAnalysis,
+            updatedAt: new Date().toISOString(),
+            status: 'running',
+            stage: 'static_analysis',
+            stageMessage: 'Running static reverse analysis in Cerberus Lab.',
+            summary: 'Running local reverse analysis in Cerberus Lab.',
+          });
+
+          const report = await analyzeWithCerberusLab({
+            configuration: this.configuration,
+            fileInfo: effectiveFileInfo,
+            fileBuffer: buffer,
+            sha256,
+            metadata: {
+              ...metadata,
+              onLog: (level, message, details) => {
+                this.log(level, message, details);
+              },
+              onStageUpdate: (stage, stageMessage) => {
+                persistedAnalysis = this.persistAnalysis({
+                  ...persistedAnalysis,
+                  updatedAt: new Date().toISOString(),
+                  status: 'running',
+                  stage,
+                  stageMessage,
+                  summary: stageMessage || persistedAnalysis.summary,
+                });
+              },
+            },
+          });
+          score = report.score;
+          signatures = report.signatures;
+          verdict = report.verdict;
+          summary = report.summary;
+          raw = report.raw;
+        }
+
+        const completedAnalysis = this.persistAnalysis({
           ...persistedAnalysis,
           updatedAt: new Date().toISOString(),
           status: 'completed',
+          stage: 'completed',
+          stageMessage: 'Sandbox analysis completed.',
           verdict,
           score,
-          summary: buildSummary(verdict, score, signatures, report),
+          summary,
           reportUrl: null,
           errorMessage: null,
+          externalTaskId,
           signatures,
-          raw: report,
+          raw,
         });
 
         this.log('INFO', 'Sandbox analysis completed.', {
@@ -305,15 +501,18 @@ export class SandboxService {
           sha256,
           verdict,
           score,
-          taskId,
+          provider: this.configuration.sandboxProvider,
+          taskId: externalTaskId,
         });
 
         return completedAnalysis;
       } catch (error) {
-        const failedAnalysis = upsertSandboxAnalysis({
+        const failedAnalysis = this.persistAnalysis({
           ...persistedAnalysis,
           updatedAt: new Date().toISOString(),
           status: 'failed',
+          stage: 'failed',
+          stageMessage: error instanceof Error ? error.message : 'Sandbox analysis failed.',
           verdict: 'unknown',
           summary: 'Sandbox analysis failed.',
           errorMessage: error instanceof Error ? error.message : 'Sandbox analysis failed.',
@@ -333,6 +532,7 @@ export class SandboxService {
       }
     })().finally(() => {
       this.inFlight.delete(inFlightKey);
+      this.inFlightAnalysisIds.delete(baseAnalysis.id);
     });
 
     this.inFlight.set(inFlightKey, analysisPromise);

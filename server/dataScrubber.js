@@ -1,3 +1,5 @@
+import { sanitizeUntrustedMetadataForLlm, sanitizeUntrustedTextForLlm } from './promptInjectionGuard.js';
+
 const SENSITIVE_PATTERNS = [
   {
     label: 'credit_card',
@@ -142,11 +144,24 @@ export const preparePacketForLlm = (packet, config, providerDefinition) => {
   const decodedPayload = decodeHexPayload(packet.payloadSnippet);
   const shouldScrub = config.payloadMaskingMode === 'strict' || !providerDefinition.local;
 
-  if (!shouldScrub) {
+  const sanitizeUntrustedContent = (payloadText, l7Metadata) => {
+    const sanitizedPayload = sanitizeUntrustedTextForLlm(payloadText, 320);
+    const sanitizedMetadata = sanitizeUntrustedMetadataForLlm(l7Metadata, { maxLength: 240 });
+
     return {
-      payloadText: decodedPayload,
+      payloadText: sanitizedPayload.text,
+      l7Metadata: sanitizedMetadata.metadata,
+      promptInjectionSignals: [...new Set([...sanitizedPayload.signals, ...sanitizedMetadata.signals])],
+    };
+  };
+
+  if (!shouldScrub) {
+    const sanitized = sanitizeUntrustedContent(decodedPayload, packet.l7Metadata);
+    return {
+      payloadText: sanitized.payloadText,
       payloadHex: packet.payloadSnippet,
-      l7Metadata: packet.l7Metadata,
+      l7Metadata: sanitized.l7Metadata,
+      promptInjectionSignals: sanitized.promptInjectionSignals,
       masking: {
         applied: false,
         redactions: [],
@@ -156,11 +171,13 @@ export const preparePacketForLlm = (packet, config, providerDefinition) => {
 
   const scrubbedPayload = scrubText(decodedPayload);
   const scrubbedMetadata = scrubMetadata(packet.l7Metadata);
+  const sanitized = sanitizeUntrustedContent(scrubbedPayload.text, scrubbedMetadata.metadata);
 
   return {
-    payloadText: scrubbedPayload.text,
+    payloadText: sanitized.payloadText,
     payloadHex: '',
-    l7Metadata: scrubbedMetadata.metadata,
+    l7Metadata: sanitized.l7Metadata,
+    promptInjectionSignals: sanitized.promptInjectionSignals,
     masking: {
       applied: true,
       redactions: [...new Set([...scrubbedPayload.redactions, ...scrubbedMetadata.redactions])],

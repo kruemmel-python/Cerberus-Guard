@@ -254,6 +254,7 @@ Im Bereich `Sandbox-Analysen` siehst du typischerweise:
 - Score
 - Signaturen
 - Summary
+- PDF-Bericht zum direkten Export fuer SOC-Dokumentation
 
 Zusatz:
 

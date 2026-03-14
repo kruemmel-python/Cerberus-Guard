@@ -29,7 +29,7 @@ const threatIntelSourceSchema = z.object({
   enabled: z.boolean(),
 });
 
-const sandboxProviderSchema = z.enum(['none', 'cape']);
+const sandboxProviderSchema = z.enum(['none', 'cape', 'cerberus_lab']);
 
 const customRuleConditionSchema = z.object({
   id: z.string().min(1).default(() => crypto.randomUUID()),
@@ -106,6 +106,7 @@ const serverConfigurationSchema = z.object({
   liveRawFeedEnabled: z.boolean(),
   firewallIntegrationEnabled: z.boolean(),
   pcapBufferSize: z.number().int().min(1).max(100),
+  localLlmTimeoutSeconds: z.number().int().min(30).max(900),
   payloadMaskingMode: z.enum(['strict', 'raw_local_only']),
   sandboxEnabled: z.boolean(),
   sandboxProvider: sandboxProviderSchema,
@@ -114,6 +115,9 @@ const serverConfigurationSchema = z.object({
   sandboxPollingIntervalMs: z.number().int().min(1000).max(60000),
   sandboxTimeoutSeconds: z.number().int().min(30).max(3600),
   sandboxAutoSubmitSuspicious: z.boolean(),
+  sandboxPrioritizeLlmWorkloads: z.boolean(),
+  sandboxDynamicExecutionEnabled: z.boolean(),
+  sandboxDynamicRuntimeSeconds: z.number().int().min(10).max(600),
   threatIntelEnabled: z.boolean(),
   threatIntelRefreshHours: z.number().int().min(1).max(168),
   threatIntelAutoBlock: z.boolean(),

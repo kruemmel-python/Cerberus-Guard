@@ -2,6 +2,8 @@ import net from 'node:net';
 
 const DDOS_WINDOW_MS = 5_000;
 const DDOS_PACKET_THRESHOLD = 150;
+const DDOS_TCP_SOURCE_PORT_THRESHOLD = 8;
+const DDOS_PROTECTED_PORT_MAX = 1024;
 const PORT_SCAN_WINDOW_MS = 15_000;
 const PORT_SCAN_PORT_THRESHOLD = 12;
 const BRUTE_FORCE_WINDOW_MS = 30_000;
@@ -10,7 +12,7 @@ const BRUTE_FORCE_ATTEMPTS = 16;
 const SENSITIVE_PORTS = new Set([21, 22, 23, 25, 110, 143, 443, 445, 587, 993, 995, 1433, 1521, 3306, 3389, 5432]);
 const BRUTE_FORCE_PORTS = new Set([21, 22, 23, 25, 110, 143, 587, 993, 995, 1433, 1521, 3306, 3389, 5432]);
 const BRUTE_FORCE_L7_PROTOCOLS = new Set(['SSH', 'FTP', 'RDP', 'SQL']);
-const COMMON_BENIGN_PORTS = new Set([53, 80, 123, 443, 853]);
+const COMMON_BENIGN_PORTS = new Set([53, 80, 123, 443, 853, 5353]);
 const MALICIOUS_KEYWORDS = [
   'powershell',
   'invoke-expression',
@@ -47,6 +49,17 @@ const pruneAttemptsByTarget = (attemptsByTarget, cutoff) => {
       continue;
     }
     attemptsByTarget.set(targetKey, prunedTimestamps);
+  }
+};
+
+const pruneDdosCandidatesByTarget = (candidatesByTarget, cutoff) => {
+  for (const [targetKey, entries] of candidatesByTarget.entries()) {
+    const prunedEntries = entries.filter(entry => entry.timestamp >= cutoff);
+    if (prunedEntries.length === 0) {
+      candidatesByTarget.delete(targetKey);
+      continue;
+    }
+    candidatesByTarget.set(targetKey, prunedEntries);
   }
 };
 
@@ -151,7 +164,7 @@ export class HeuristicAnalyzer {
     }
 
     const nextState = {
-      packetTimestamps: [],
+      ddosCandidatesByTarget: new Map(),
       authAttemptsByTarget: new Map(),
       portTouches: [],
     };
@@ -197,12 +210,29 @@ export class HeuristicAnalyzer {
     const bruteForceTargetKey = bruteForceCandidate
       ? `${packet.destinationIp}:${packet.destinationPort}:${packet.l7Protocol}`
       : null;
+    const protectedDestinationPort = packet.destinationPort <= DDOS_PROTECTED_PORT_MAX
+      || SENSITIVE_PORTS.has(packet.destinationPort)
+      || config.monitoringPorts.includes(packet.destinationPort);
+    const ddosCandidate = packet.direction === 'INBOUND'
+      && protectedDestinationPort
+      && (packet.protocol === 'TCP' || packet.protocol === 'UDP');
+    const ddosTargetKey = ddosCandidate
+      ? `${packet.destinationIp}:${packet.destinationPort}:${packet.protocol}`
+      : null;
 
-    state.packetTimestamps.push(now);
+    pruneDdosCandidatesByTarget(state.ddosCandidatesByTarget, now - DDOS_WINDOW_MS);
     pruneAttemptsByTarget(state.authAttemptsByTarget, now - BRUTE_FORCE_WINDOW_MS);
     state.portTouches = state.portTouches.filter(entry => entry.timestamp >= now - PORT_SCAN_WINDOW_MS);
-    state.packetTimestamps = prune(state.packetTimestamps, now - DDOS_WINDOW_MS);
     state.portTouches.push({ port: packet.destinationPort, timestamp: now });
+
+    if (ddosTargetKey) {
+      const ddosEntries = state.ddosCandidatesByTarget.get(ddosTargetKey) ?? [];
+      ddosEntries.push({
+        timestamp: now,
+        sourcePort: packet.sourcePort,
+      });
+      state.ddosCandidatesByTarget.set(ddosTargetKey, ddosEntries);
+    }
 
     if (bruteForceTargetKey) {
       const attempts = state.authAttemptsByTarget.get(bruteForceTargetKey) ?? [];
@@ -212,15 +242,45 @@ export class HeuristicAnalyzer {
 
     const uniqueTouchedPorts = new Set(state.portTouches.map(entry => entry.port));
     const targetAttempts = bruteForceTargetKey ? state.authAttemptsByTarget.get(bruteForceTargetKey) ?? [] : [];
+    const ddosTargetEntries = ddosTargetKey ? state.ddosCandidatesByTarget.get(ddosTargetKey) ?? [] : [];
+    const ddosDistinctSourcePorts = new Set(ddosTargetEntries.map(entry => entry.sourcePort)).size;
+    const normalizedDestinationIp = typeof packet.destinationIp === 'string' ? packet.destinationIp.toLowerCase() : '';
+    const isMulticastDnsDiscovery = packet.protocol === 'UDP'
+      && (packet.destinationPort === 5353 || packet.sourcePort === 5353)
+      && ['224.0.0.251', 'ff02::fb'].includes(normalizedDestinationIp)
+      && ['UNKNOWN', 'DNS', 'MDNS'].includes(packet.l7Protocol);
 
-    if (state.packetTimestamps.length >= DDOS_PACKET_THRESHOLD) {
+    if (isMulticastDnsDiscovery) {
+      return {
+        result: buildResult(packet, {
+          confidence: 0.02,
+          explanation: 'Local multicast DNS discovery traffic was treated as benign service discovery.',
+          matchedSignals: ['protocol.mdns.discovery'],
+        }),
+        needsDeepInspection: false,
+      };
+    }
+
+    if (
+      ddosTargetKey
+      && ddosTargetEntries.length >= DDOS_PACKET_THRESHOLD
+      && (
+        packet.protocol === 'UDP'
+        || ddosDistinctSourcePorts >= DDOS_TCP_SOURCE_PORT_THRESHOLD
+      )
+    ) {
       return {
         result: buildResult(packet, {
           isSuspicious: true,
           attackType: 'ddos',
           confidence: 0.99,
-          explanation: 'High packet rate from the same source indicates a volumetric attack.',
-          matchedSignals: ['rate.ddos.threshold'],
+          explanation: packet.protocol === 'UDP'
+            ? 'High inbound UDP packet rate against the same service indicates a volumetric flood.'
+            : 'High inbound TCP packet rate across many remote source ports against the same service indicates a flood attack.',
+          matchedSignals: [
+            'rate.ddos.threshold',
+            packet.protocol === 'UDP' ? 'transport.udp.flood' : 'transport.tcp.multi_source_port_flood',
+          ],
           recommendedActionType: 'BLOCK',
         }),
         needsDeepInspection: false,

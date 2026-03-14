@@ -7,6 +7,7 @@ import {
   MetricSnapshot,
   PcapArtifact,
   SandboxAnalysisSummary,
+  SandboxLlmDebugPayload,
   SensorSummary,
   ServerConfiguration,
   ThreatHuntingResponse,
@@ -15,7 +16,7 @@ import {
   TrafficMetricPoint,
 } from '../types';
 
-const normalizeBaseUrl = (baseUrl: string) => {
+export const normalizeBaseUrl = (baseUrl: string) => {
   const trimmed = baseUrl.trim();
   return trimmed.replace(/\/+$/, '') || 'http://localhost:8081';
 };
@@ -208,6 +209,45 @@ export const analyzeProcessFileInSandbox = async (
       trafficEventId: options?.trafficEventId || null,
     }),
   });
+
+export const analyzeUploadedFileInSandbox = async (baseUrl: string, files: File[]) => {
+  if (!files.length) {
+    throw new Error('No files selected for sandbox upload.');
+  }
+
+  const formData = new FormData();
+  formData.append('sample', files[0]);
+  files.slice(1).forEach(file => {
+    formData.append('attachments', file);
+  });
+
+  return fetchJson<{ ok: boolean; analysis: SandboxAnalysisSummary; error?: string; }>(
+    `${normalizeBaseUrl(baseUrl)}/api/sandbox/analyze-upload`,
+    {
+      method: 'POST',
+      body: formData,
+    }
+  );
+};
+
+export const retrySandboxAnalystReview = async (baseUrl: string, analysisId: string) =>
+  fetchJson<{ ok: boolean; analysis: SandboxAnalysisSummary; error?: string; }>(
+    `${normalizeBaseUrl(baseUrl)}/api/sandbox/analyses/${encodeURIComponent(analysisId)}/retry-review`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+export const getSandboxLlmDebug = async (baseUrl: string, analysisId: string) =>
+  fetchJson<{ ok: boolean; debug: SandboxLlmDebugPayload; error?: string; }>(
+    `${normalizeBaseUrl(baseUrl)}/api/sandbox/analyses/${encodeURIComponent(analysisId)}/llm-debug`
+  );
+
+export const getSandboxReportDownloadUrl = (baseUrl: string, analysisId: string) =>
+  `${normalizeBaseUrl(baseUrl)}/api/sandbox/analyses/${encodeURIComponent(analysisId)}/report.pdf`;
 
 export const getArtifactDownloadUrl = (baseUrl: string, artifactId: string) =>
   `${normalizeBaseUrl(baseUrl)}/api/pcap-artifacts/${encodeURIComponent(artifactId)}/download`;

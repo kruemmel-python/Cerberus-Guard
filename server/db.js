@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -7,11 +8,13 @@ import { normalizeServerConfiguration, sanitizeConfigurationForClient } from './
 const dataDirectory = path.resolve(process.cwd(), 'data');
 const pcapDirectory = path.join(dataDirectory, 'pcap');
 const replayDirectory = path.join(dataDirectory, 'replay');
+const sandboxUploadsDirectory = path.join(dataDirectory, 'sandbox-uploads');
 const databasePath = path.join(dataDirectory, 'netguard.db');
 
 fs.mkdirSync(dataDirectory, { recursive: true });
 fs.mkdirSync(pcapDirectory, { recursive: true });
 fs.mkdirSync(replayDirectory, { recursive: true });
+fs.mkdirSync(sandboxUploadsDirectory, { recursive: true });
 
 const db = new Database(databasePath);
 db.pragma('journal_mode = WAL');
@@ -74,6 +77,8 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     status TEXT NOT NULL,
+    stage TEXT,
+    stage_message TEXT,
     provider TEXT NOT NULL,
     verdict TEXT NOT NULL,
     summary TEXT NOT NULL,
@@ -152,11 +157,18 @@ ensureColumn('pcap_artifacts', 'sensor_id', 'TEXT');
 ensureColumn('pcap_artifacts', 'sensor_name', 'TEXT');
 ensureColumn('sandbox_analyses', 'sensor_id', 'TEXT');
 ensureColumn('sandbox_analyses', 'sensor_name', 'TEXT');
+ensureColumn('sandbox_analyses', 'stage', 'TEXT');
+ensureColumn('sandbox_analyses', 'stage_message', 'TEXT');
 
 const configRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('activeConfig');
 if (!configRow) {
   const defaultConfiguration = normalizeServerConfiguration(createDefaultServerConfig());
   db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('activeConfig', JSON.stringify(defaultConfiguration));
+}
+
+const instanceIdRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('serverInstanceId');
+if (!instanceIdRow) {
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('serverInstanceId', crypto.randomUUID());
 }
 
 const serialize = (value) => JSON.stringify(value ?? null);
@@ -192,6 +204,7 @@ export const directories = {
   dataDirectory,
   pcapDirectory,
   replayDirectory,
+  sandboxUploadsDirectory,
   databasePath,
 };
 
@@ -202,6 +215,11 @@ export const getServerConfiguration = () => {
 };
 
 export const getClientConfiguration = () => sanitizeConfigurationForClient(getServerConfiguration());
+
+export const getServerInstanceId = () => {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('serverInstanceId');
+  return typeof row?.value === 'string' && row.value.trim() ? row.value.trim() : crypto.randomUUID();
+};
 
 export const saveServerConfiguration = (configuration) => {
   const normalizedConfiguration = normalizeServerConfiguration(configuration);
@@ -365,21 +383,13 @@ export const insertPcapArtifact = (artifact) => {
 };
 
 export const upsertSandboxAnalysis = (analysis) => {
-  db.prepare(`
-    INSERT OR REPLACE INTO sandbox_analyses (
-      id, created_at, updated_at, status, provider, verdict, summary, score, file_path, file_name,
-      file_size, sha256, process_name, traffic_event_id, external_task_id, report_url, error_message,
-      signatures_json, raw_json, sensor_id, sensor_name
-    ) VALUES (
-      @id, @createdAt, @updatedAt, @status, @provider, @verdict, @summary, @score, @filePath, @fileName,
-      @fileSize, @sha256, @processName, @trafficEventId, @externalTaskId, @reportUrl, @errorMessage,
-      @signaturesJson, @rawJson, @sensorId, @sensorName
-    )
-  `).run({
+  const persistedRow = {
     id: analysis.id,
     createdAt: analysis.createdAt,
     updatedAt: analysis.updatedAt,
     status: analysis.status,
+    stage: analysis.stage ?? analysis.status,
+    stageMessage: analysis.stageMessage ?? null,
     provider: analysis.provider,
     verdict: analysis.verdict,
     summary: analysis.summary,
@@ -397,59 +407,226 @@ export const upsertSandboxAnalysis = (analysis) => {
     rawJson: serialize(analysis.raw ?? null),
     sensorId: analysis.sensorId ?? null,
     sensorName: analysis.sensorName ?? null,
-  });
+  };
 
-  return analysis;
+  db.prepare(`
+    INSERT OR REPLACE INTO sandbox_analyses (
+      id, created_at, updated_at, status, stage, stage_message, provider, verdict, summary, score, file_path, file_name,
+      file_size, sha256, process_name, traffic_event_id, external_task_id, report_url, error_message,
+      signatures_json, raw_json, sensor_id, sensor_name
+    ) VALUES (
+      @id, @createdAt, @updatedAt, @status, @stage, @stageMessage, @provider, @verdict, @summary, @score, @filePath, @fileName,
+      @fileSize, @sha256, @processName, @trafficEventId, @externalTaskId, @reportUrl, @errorMessage,
+      @signaturesJson, @rawJson, @sensorId, @sensorName
+    )
+  `).run(persistedRow);
+
+  return mapSandboxAnalysisRow(persistedRow, { includeRaw: true });
 };
 
-const mapSandboxAnalysisRow = row => ({
-  id: row.id,
-  createdAt: row.createdAt,
-  updatedAt: row.updatedAt,
-  status: row.status,
-  provider: row.provider,
-  verdict: row.verdict,
-  summary: row.summary,
-  score: row.score === null || row.score === undefined ? null : Number(row.score),
-  filePath: row.filePath,
-  fileName: row.fileName,
-  fileSize: Number(row.fileSize ?? 0),
-  sha256: row.sha256,
-  processName: row.processName ?? null,
-  trafficEventId: row.trafficEventId ?? null,
-  externalTaskId: row.externalTaskId ?? null,
-  reportUrl: row.reportUrl ?? null,
-  errorMessage: row.errorMessage ?? null,
-  signatures: deserialize(row.signaturesJson, []),
-  sensorId: row.sensorId ?? 'unknown',
-  sensorName: row.sensorName ?? 'Unknown Sensor',
-});
+const hasMeaningfulLlmReview = llmReview => Boolean(
+  llmReview
+  && typeof llmReview === 'object'
+  && (
+    (typeof llmReview.executiveSummary === 'string' && llmReview.executiveSummary.trim())
+    || (Array.isArray(llmReview.suspectedCapabilities) && llmReview.suspectedCapabilities.length > 0)
+    || (Array.isArray(llmReview.recommendedNextSteps) && llmReview.recommendedNextSteps.length > 0)
+  )
+);
+
+const salvagePlainTextLlmReview = rawResponseText => {
+  if (typeof rawResponseText !== 'string' || !rawResponseText.trim()) {
+    return null;
+  }
+
+  const normalizedText = rawResponseText
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .replace(/^\s*(analyst summary|summary|review)\s*:\s*/i, '')
+    .trim();
+
+  if (!normalizedText) {
+    return null;
+  }
+
+  const bulletLines = normalizedText
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => /^[-*•]\s+/.test(line))
+    .map(line => line.replace(/^[-*•]\s+/, '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const paragraphs = normalizedText
+    .split(/\n\s*\n/)
+    .map(paragraph => paragraph.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const executiveSummary = paragraphs[0] || normalizedText.replace(/\s+/g, ' ').trim();
+  if (!executiveSummary) {
+    return null;
+  }
+
+  return {
+    skipped: false,
+    executiveSummary,
+    suspectedCapabilities: [],
+    recommendedNextSteps: bulletLines,
+  };
+};
+
+const normalizePersistedLlmReview = raw => {
+  const llmReview = raw?.llmReview;
+  if (hasMeaningfulLlmReview(llmReview) || llmReview?.skipped === true && !raw?.llmReviewDebug?.rawResponseText) {
+    return llmReview;
+  }
+
+  const salvagedReview = salvagePlainTextLlmReview(raw?.llmReviewDebug?.rawResponseText);
+  return salvagedReview || llmReview || null;
+};
+
+const getSandboxReportAvailability = (status, provider, raw, stageMessage, errorMessage) => {
+  if (provider === 'cerberus_lab') {
+    const llmReview = normalizePersistedLlmReview(raw);
+    if (hasMeaningfulLlmReview(llmReview)) {
+      return {
+        reportReady: true,
+        reportPendingReason: null,
+      };
+    }
+
+    if (llmReview?.skipped === true && typeof llmReview.reason === 'string' && llmReview.reason.trim()) {
+      return {
+        reportReady: false,
+        reportPendingReason: llmReview.reason.trim(),
+      };
+    }
+
+    if (status === 'completed') {
+      return {
+        reportReady: false,
+        reportPendingReason: 'Analyst review is not available yet.',
+      };
+    }
+
+    return {
+      reportReady: false,
+      reportPendingReason: stageMessage || errorMessage || 'Analyst review is still pending.',
+    };
+  }
+
+  return {
+    reportReady: ['completed', 'failed'].includes(status),
+    reportPendingReason: ['completed', 'failed'].includes(status)
+      ? null
+      : (stageMessage || errorMessage || 'Sandbox report is not ready yet.'),
+  };
+};
+
+const mapSandboxAnalysisRow = (row, { includeRaw = false } = {}) => {
+  const raw = deserialize(row.rawJson, null);
+  if (raw && typeof raw === 'object') {
+    raw.llmReview = normalizePersistedLlmReview(raw);
+  }
+  const reportAvailability = getSandboxReportAvailability(
+    row.status,
+    row.provider,
+    raw,
+    row.stageMessage ?? null,
+    row.errorMessage ?? null
+  );
+
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    status: row.status,
+    stage: row.stage ?? row.status,
+    stageMessage: row.stageMessage ?? null,
+    provider: row.provider,
+    verdict: row.verdict,
+    summary: row.summary,
+    score: row.score === null || row.score === undefined ? null : Number(row.score),
+    filePath: row.filePath,
+    fileName: row.fileName,
+    fileSize: Number(row.fileSize ?? 0),
+    sha256: row.sha256,
+    processName: row.processName ?? null,
+    trafficEventId: row.trafficEventId ?? null,
+    externalTaskId: row.externalTaskId ?? null,
+    reportUrl: row.reportUrl ?? null,
+    errorMessage: row.errorMessage ?? null,
+    signatures: deserialize(row.signaturesJson, []),
+    reportReady: reportAvailability.reportReady,
+    reportPendingReason: reportAvailability.reportPendingReason,
+    sensorId: row.sensorId ?? 'unknown',
+    sensorName: row.sensorName ?? 'Unknown Sensor',
+    ...(includeRaw ? { raw } : {}),
+  };
+};
 
 export const listRecentSandboxAnalyses = (limit = 25, sensorId = null) =>
   db.prepare(`
-    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, provider, verdict, summary, score,
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, stage, stage_message AS stageMessage, provider, verdict, summary, score,
            file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
            traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
-           error_message AS errorMessage, signatures_json AS signaturesJson, sensor_id AS sensorId, sensor_name AS sensorName
+           error_message AS errorMessage, signatures_json AS signaturesJson, raw_json AS rawJson, sensor_id AS sensorId, sensor_name AS sensorName
     FROM sandbox_analyses
     ${buildSensorFilterSql(sensorId, 'sensor_id')}
     ORDER BY created_at DESC
     LIMIT @limit
   `).all({ limit, sensorId }).map(mapSandboxAnalysisRow);
 
-export const getLatestSandboxAnalysisBySha256 = (sha256, provider) => {
-  const row = db.prepare(`
-    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, provider, verdict, summary, score,
+export const listStalePendingSandboxAnalyses = (updatedBefore, sensorId = null) =>
+  db.prepare(`
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, stage, stage_message AS stageMessage, provider, verdict, summary, score,
            file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
            traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
-           error_message AS errorMessage, signatures_json AS signaturesJson, sensor_id AS sensorId, sensor_name AS sensorName
+           error_message AS errorMessage, signatures_json AS signaturesJson, raw_json AS rawJson, sensor_id AS sensorId, sensor_name AS sensorName
+    FROM sandbox_analyses
+    WHERE status IN ('queued', 'running')
+      AND updated_at < @updatedBefore
+      ${sensorId ? 'AND sensor_id = @sensorId' : ''}
+    ORDER BY updated_at ASC
+  `).all({ updatedBefore, sensorId }).map(mapSandboxAnalysisRow);
+
+export const deleteSandboxAnalysesByIds = (analysisIds) => {
+  if (!Array.isArray(analysisIds) || analysisIds.length === 0) {
+    return 0;
+  }
+
+  const placeholders = analysisIds.map(() => '?').join(', ');
+  return db.prepare(`DELETE FROM sandbox_analyses WHERE id IN (${placeholders})`).run(...analysisIds).changes;
+};
+
+export const getLatestSandboxAnalysisBySha256 = (sha256, provider, { includeRaw = false } = {}) => {
+  const row = db.prepare(`
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, stage, stage_message AS stageMessage, provider, verdict, summary, score,
+           file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
+           traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
+           error_message AS errorMessage, signatures_json AS signaturesJson, raw_json AS rawJson,
+           sensor_id AS sensorId, sensor_name AS sensorName
     FROM sandbox_analyses
     WHERE sha256 = @sha256 AND provider = @provider
     ORDER BY created_at DESC
     LIMIT 1
   `).get({ sha256, provider });
 
-  return row ? mapSandboxAnalysisRow(row) : null;
+  return row ? mapSandboxAnalysisRow(row, { includeRaw }) : null;
+};
+
+export const getSandboxAnalysisById = (analysisId, { includeRaw = false } = {}) => {
+  const row = db.prepare(`
+    SELECT id, created_at AS createdAt, updated_at AS updatedAt, status, stage, stage_message AS stageMessage, provider, verdict, summary, score,
+           file_path AS filePath, file_name AS fileName, file_size AS fileSize, sha256, process_name AS processName,
+           traffic_event_id AS trafficEventId, external_task_id AS externalTaskId, report_url AS reportUrl,
+           error_message AS errorMessage, signatures_json AS signaturesJson, raw_json AS rawJson,
+           sensor_id AS sensorId, sensor_name AS sensorName
+    FROM sandbox_analyses
+    WHERE id = ?
+  `).get(analysisId);
+
+  return row ? mapSandboxAnalysisRow(row, { includeRaw }) : null;
 };
 
 export const listPcapArtifacts = (limit = 50, sensorId = null) =>

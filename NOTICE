@@ -1,0 +1,23 @@
+Cerberus Guard & Lab
+Copyright 2026 Ralf Krümmel
+
+This product includes software developed by Ralf Krümmel.
+
+PROOFS OF INNOVATION:
+- Developed as a disruptive alternative to conventional "Best Practice" security 
+  architectures.
+- Heuristic logic successfully identified malicious payloads in documents 
+  classified as "clean" (0/96 detection rate) by all major industry vendors 
+  on VirusTotal (Status: 14.03.2026).
+- Implements advanced ontological integrity checks, including high-entropy 
+  stream analysis and cross-process attribution (Cerberus Vigilance).
+
+TRADEMARK AND ATTRIBUTION:
+The name "Cerberus Guard", "Cerberus Lab", and the associated heuristic 
+methodologies are the intellectual property of Ralf Krümmel. 
+Any redistribution or derivative work must retain this notice and 
+acknowledge the original authorship and the documented "0/96 Kill-Rate" 
+milestone.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
